@@ -2,7 +2,7 @@
   "name": "backend",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
     "dev": "nodemon server.js",
     "start": "node server.js",
@@ -16,10 +16,14 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+<<<<<<< HEAD
     "munkres-js": "^1.2.2",
     "pg": "^8.16.3"
+=======
+    "pg": "^8.23.1"
+>>>>>>> f532678074763ced8a761a063a8372a83c0d87da
   },
   "devDependencies": {
-    "nodemon": "^3.1.14"
+    "nodemon": "^1.14.10"
   }
 }
