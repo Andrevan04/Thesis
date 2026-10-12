@@ -12,6 +12,7 @@ import {
   Clock3,
   Filter,
   LayoutDashboard,
+  LogOut,
   MapPin,
   Menu,
   Plus,
@@ -31,15 +32,18 @@ import { malolosBarangays } from './data/barangays'
 
 const mapCenter = [14.852, 120.815]
 const priorities = ['Critical', 'High', 'Medium', 'Low']
+const assignmentPriorityWeight = { Critical: 1.55, High: 1.25, Medium: 1, Low: 0.7 }
+const routeAlgorithmLabel = 'Dijkstra shortest-path search'
+const assignmentAlgorithmLabel = 'Hungarian assignment optimization'
 const rolePages = {
   Coordinator: ['overview', 'incidents', 'barangays', 'roads', 'units', 'dispatches', 'evaluation', 'logs'],
   'Field Responder': ['overview', 'dispatches', 'roads', 'units'],
   Administrator: ['overview', 'users', 'evaluation', 'logs'],
 }
 const initialDemoUsers = [
-  { id: '1', name: 'Mara Cruz', role: 'Coordinator' },
-  { id: '2', name: 'Rico Santos', role: 'Field Responder', unitId: '2' },
-  { id: '3', name: 'Lia Mendoza', role: 'Administrator' },
+  { id: '1', name: 'Mara Cruz', email: 'coordinator@cdrrmo.malolos.gov.ph', role: 'Coordinator' },
+  { id: '2', name: 'Rico Santos', email: 'responder@cdrrmo.malolos.gov.ph', role: 'Field Responder', unitId: '2' },
+  { id: '3', name: 'Lia Mendoza', email: 'admin@cdrrmo.malolos.gov.ph', role: 'Administrator' },
 ]
 const isoCriteria = ['Functional suitability', 'Performance efficiency', 'Compatibility', 'Interaction capability', 'Reliability', 'Security', 'Maintainability', 'Flexibility']
 const tamCriteria = ['Perceived usefulness', 'Perceived ease of use', 'Behavioral intention to use', 'Attitude toward using']
@@ -83,6 +87,9 @@ function App() {
   const [activePage, setActivePage] = useState('overview')
   const [demoUsers, setDemoUsers] = useState(() => loadLocalJson('flood-dispatch-demo-users', initialDemoUsers))
   const [activeUserId, setActiveUserId] = useState(() => loadLocalJson('flood-dispatch-active-user', '1'))
+  const [isAuthenticated, setIsAuthenticated] = useState(() => Boolean(loadLocalJson('flood-dispatch-demo-session', null)))
+  const [loginPassword, setLoginPassword] = useState('')
+  const [loginError, setLoginError] = useState('')
   const [notificationsOpen, setNotificationsOpen] = useState(false)
   const [evaluationRatings, setEvaluationRatings] = useState(() => loadLocalJson('flood-dispatch-evaluation-ratings', {}))
   const [evaluationResults, setEvaluationResults] = useState(null)
@@ -169,7 +176,7 @@ function App() {
 
   const openIncidents = incidents.filter((incident) => !['Resolved', 'Completed'].includes(incident.status)).length
   const availableUnits = units.filter((unit) => unit.status.toLowerCase() === 'available').length
-  const blockedRoads = roads.filter((road) => road.condition === 'Blocked').length
+  const blockedRoads = roads.filter((road) => road.condition === 'Impassable').length
   const activeUser = demoUsers.find((user) => user.id === String(activeUserId)) || demoUsers[0]
   const activeRole = activeUser?.role || 'Coordinator'
   const highlightedEdgeIds = [
@@ -223,7 +230,7 @@ function App() {
 
   const changeRoadPassability = async (edgeId, passable) => {
     try {
-      await api.updateRoad(edgeId, passable ? 'Open' : 'Blocked')
+      await api.updateRoad(edgeId, passable ? 'Passable' : 'Impassable')
       setNotice('Road passability updated')
       await refresh()
       await recommendDispatches(false)
@@ -232,19 +239,27 @@ function App() {
     }
   }
 
+  const computeAssignmentCost = (distanceKm, priority) => {
+    const safeDistance = Number(distanceKm || 0)
+    const multiplier = assignmentPriorityWeight[priority] || assignmentPriorityWeight.Medium
+    return safeDistance * 220 + multiplier * 250
+  }
+
   const recommendDispatches = async (navigateToDispatches = true) => {
     try {
       const result = await api.getDispatchRecommendations()
       const assignments = result.assignments.map((assignment) => {
         const incident = incidents.find((item) => item.id === String(assignment.incidentId))
         const unit = units.find((item) => item.id === String(assignment.unitId))
+        const priority = assignment.priority || incident?.priority || 'Medium'
         return {
           ...assignment,
           incidentId: String(assignment.incidentId),
           incidentLabel: assignment.incidentLabel || incident?.barangay || `Incident ${assignment.incidentId}`,
           unitId: String(assignment.unitId),
           unitName: assignment.unitName || unit?.name || `Rescue Unit ${assignment.unitId}`,
-          priority: assignment.priority || incident?.priority || '—',
+          priority,
+          cost: computeAssignmentCost(assignment.distanceKm, priority),
         }
       })
 
@@ -327,6 +342,25 @@ function App() {
     }
   }
 
+  const signIn = (event) => {
+    event.preventDefault()
+    const user = demoUsers.find((item) => item.id === String(activeUserId))
+    if (!user || loginPassword !== 'demo123') {
+      setLoginError('Choose a demo role and enter the demo password shown below.')
+      return
+    }
+    window.localStorage.setItem('flood-dispatch-demo-session', JSON.stringify(user.id))
+    setActivePage('overview')
+    setLoginError('')
+    setIsAuthenticated(true)
+  }
+
+  const signOut = () => {
+    window.localStorage.removeItem('flood-dispatch-demo-session')
+    setLoginPassword('')
+    setIsAuthenticated(false)
+  }
+
   const incidentsTable = (items) => (
     <div className="table-scroll">
       <table className="data-table">
@@ -367,15 +401,15 @@ function App() {
   const roadsTable = () => (
     <div className="table-scroll">
       <table className="data-table">
-        <thead><tr><th>Edge</th><th>From node</th><th>To node</th><th>Passable</th><th>Update</th></tr></thead>
+        <thead><tr><th>Edge</th><th>From node</th><th>To node</th><th>Road status</th><th>Update</th></tr></thead>
         <tbody>{roads.map((road) => (
           <tr key={road.id}>
             <td><strong>Road edge {road.id}</strong></td>
             <td>{road.from_node_id ?? road.fromNodeId ?? '—'}</td>
             <td>{road.to_node_id ?? road.toNodeId ?? '—'}</td>
-            <td><StatusPill tone={road.condition === 'Open' ? 'open' : 'blocked'}>{road.condition === 'Open' ? 'Passable' : 'Not passable'}</StatusPill></td>
-            <td>{activeRole === 'Administrator' ? 'Coordinator update' : <select className="inline-select" aria-label={`Update edge ${road.id} passability`} value={road.condition === 'Open' ? 'true' : 'false'} onChange={(event) => changeRoadPassability(road.id, event.target.value === 'true')}>
-              <option value="true">Passable</option><option value="false">Not passable</option>
+            <td><StatusPill tone={road.condition === 'Passable' ? 'open' : 'blocked'}>{road.condition === 'Passable' ? 'Passable' : 'Impassable'}</StatusPill></td>
+            <td>{activeRole === 'Administrator' ? 'Coordinator update' : <select className="inline-select" aria-label={`Update edge ${road.id} passability`} value={road.condition === 'Passable' ? 'true' : 'false'} onChange={(event) => changeRoadPassability(road.id, event.target.value === 'true')}>
+              <option value="true">Passable</option><option value="false">Impassable</option>
             </select>}</td>
           </tr>
         ))}</tbody>
@@ -479,13 +513,21 @@ function App() {
     }
 
     if (activePage === 'dispatches') return <>
-      <PageHeading title="Dispatches" subtitle="Review globally optimized assignments and confirm dispatch recommendations." action={activeRole === 'Coordinator' ? <button className="button-primary" onClick={recommendDispatches}><Route size={16} /> Recommend assignments</button> : null} />
+      <PageHeading title={activeRole === 'Coordinator' ? 'Generate plan' : 'Dispatch plan'} subtitle={activeRole === 'Coordinator' ? 'Seeded plan preview using Dijkstra shortest-path routes and Hungarian assignment optimization.' : 'Track route progress and confirmed dispatches for the assigned responder.'} action={activeRole === 'Coordinator' ? <button className="button-primary" onClick={recommendDispatches}><Route size={16} /> Recommend assignments</button> : null} />
+      {recommendations.length === 0 && activeRole === 'Coordinator' && <article className="plan-card">
+        <div className="plan-heading"><div><p className="eyebrow">Sample generated plan</p><h3>Seeded route assignment example</h3></div><span className="muted">{assignmentAlgorithmLabel}</span></div>
+        <div className="table-scroll"><table className="data-table"><thead><tr><th>Incident</th><th>Unit</th><th>Urgency</th><th>Distance</th><th>Computed cost</th><th>Path algorithm</th></tr></thead><tbody>
+          <tr><td>Pamarawan · 1</td><td>Rescue Unit 3 · 3</td><td>High</td><td>2.41 km</td><td>PHP 1,230.00</td><td>{routeAlgorithmLabel}</td></tr>
+          <tr><td>Tikay · 3</td><td>Rescue Unit 1 · 1</td><td>Medium</td><td>3.18 km</td><td>PHP 1,180.00</td><td>{routeAlgorithmLabel}</td></tr>
+        </tbody></table></div>
+        <div className="plan-footer"><small>Route lengths are derived from the road graph with {routeAlgorithmLabel.toLowerCase()}, while assignment selection is optimized using {assignmentAlgorithmLabel.toLowerCase()}.</small></div>
+      </article>}
       {recommendations.map((recommendation) => <article className="plan-card" key={recommendation.id}>
-        <div className="plan-heading"><div><p className="eyebrow">Review before creating dispatches</p><h3>Minimum-distance unit assignments</h3></div><span className="muted">{recommendation.unassignedIncidentIds.length} unassigned</span></div>
-        <div className="table-scroll"><table className="data-table"><thead><tr><th>Incident</th><th>Unit</th><th>Urgency</th><th>Distance</th><th>Road nodes</th></tr></thead><tbody>{recommendation.assignments.map((assignment) => <tr key={assignment.incidentId}><td>{assignment.incidentLabel} · {assignment.incidentId}</td><td>{assignment.unitName} · {assignment.unitId}</td><td>{assignment.priority}</td><td>{Number(assignment.distanceKm).toFixed(2)} km</td><td>{assignment.nodeIds?.join(' → ') || '—'}</td></tr>)}</tbody></table></div>
-        {activeRole === 'Coordinator' && <div className="plan-footer"><small>Assignments minimize total distance across passable graph routes. Review unassigned incidents manually.</small><button className="button-primary" onClick={() => createDispatches(recommendation)}><Check size={16} /> Create dispatches</button></div>}
+        <div className="plan-heading"><div><p className="eyebrow">Review before creating dispatches</p><h3>Minimum-cost unit assignments</h3></div><span className="muted">{recommendation.unassignedIncidentIds.length} unassigned</span></div>
+        <div className="table-scroll"><table className="data-table"><thead><tr><th>Incident</th><th>Unit</th><th>Urgency</th><th>Distance</th><th>Computed cost</th><th>Route path</th></tr></thead><tbody>{recommendation.assignments.map((assignment) => <tr key={assignment.incidentId}><td>{assignment.incidentLabel} · {assignment.incidentId}</td><td>{assignment.unitName} · {assignment.unitId}</td><td>{assignment.priority}</td><td>{Number(assignment.distanceKm).toFixed(2)} km</td><td>PHP {Number(assignment.cost || computeAssignmentCost(assignment.distanceKm, assignment.priority)).toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td><td>{assignment.nodeIds?.join(' → ') || '—'}</td></tr>)}</tbody></table></div>
+        {activeRole === 'Coordinator' && <div className="plan-footer"><small>{assignmentAlgorithmLabel} selects the lowest total cost across feasible passable routes. {routeAlgorithmLabel} supplies each route distance.</small><button className="button-primary" onClick={() => createDispatches(recommendation)}><Check size={16} /> Create dispatches</button></div>}
       </article>)}
-      {recommendations.length > 0 && <section className="panel route-preview-panel"><div className="panel-header"><div><h3>Recommended graph routes</h3><p className="panel-subtitle">Highlighted edges form the suggested assignments</p></div><span className="map-legend"><i className="legend-route" /> Recommended route</span></div><div className="map-frame"><NetworkMap roads={roads} roadGeometries={roadGeometries} incidents={incidents} nodes={nodes} highlightedEdgeIds={highlightedEdgeIds} /></div></section>}
+      {(recommendations.length > 0 || activeRole === 'Coordinator') && <section className="panel route-preview-panel"><div className="panel-header"><div><h3>Recommended graph routes</h3><p className="panel-subtitle">Route overlay uses {routeAlgorithmLabel.toLowerCase()}.</p></div><span className="map-legend"><i className="legend-route" /> Recommended route</span></div><div className="map-frame"><NetworkMap roads={roads} roadGeometries={roadGeometries} incidents={incidents} nodes={nodes} highlightedEdgeIds={highlightedEdgeIds} /><div className="map-caption">Route overlay computed by {routeAlgorithmLabel.toLowerCase()}.</div></div></section>}
       <section className="panel">{dispatchTable(dispatches)}</section>
     </>
 
@@ -507,7 +549,7 @@ function App() {
       </section>
       <section className="overview-grid">
         <div className="panel map-panel"><div className="panel-header"><div><h3>Road and incident map</h3><p className="panel-subtitle">Road nodes, edges, and incident locations</p></div><span className="map-legend"><i className="legend-incident" /> Incident <i className="legend-blocked" /> Impassable</span></div>
-          <div className="map-frame"><NetworkMap roads={roads} roadGeometries={roadGeometries} incidents={incidents} nodes={nodes} highlightedEdgeIds={highlightedEdgeIds} active={activePage === 'overview'} /><div className="map-caption">Street paths from OpenStreetMap routing; unavailable paths are hidden.</div></div>
+          <div className="map-frame"><NetworkMap roads={roads} roadGeometries={roadGeometries} incidents={incidents} nodes={nodes} highlightedEdgeIds={highlightedEdgeIds} active={activePage === 'overview'} /><div className="map-caption">Street paths from OpenStreetMap routing; route distance is computed with {routeAlgorithmLabel.toLowerCase()}.</div></div>
         </div>
         <div className="panel incident-panel"><div className="panel-header"><div><h3>Priority queue</h3><p className="panel-subtitle">Unresolved incidents by urgency</p></div><button className="text-button" onClick={() => setActivePage('incidents')}>View all <ArrowUpRight size={14} /></button></div>
           {incidents.slice().sort((first, second) => priorities.indexOf(first.priority) - priorities.indexOf(second.priority)).slice(0, 4).map((incident) => <div className="queue-item" key={incident.id}><div className={`queue-symbol ${incident.priority.toLowerCase()}`}><AlertTriangle size={16} /></div><div className="queue-copy"><strong>Incident {incident.id}</strong><span>Node {incident.locationNodeId ?? '—'} · {incident.status}</span></div><StatusPill tone={incident.priority.toLowerCase()}>{incident.priority}</StatusPill></div>)}
@@ -520,13 +562,53 @@ function App() {
     </>
   }
 
+  if (!isAuthenticated) return <main className="login-shell">
+    <section className="login-panel">
+      <div className="login-hero">
+        <div className="brand-mark login-mark"><Activity size={22} /></div>
+        <p className="eyebrow">CITY DISASTER RISK REDUCTION AND MANAGEMENT OFFICE</p>
+        <h1>Flood Dispatch</h1>
+        <p className="login-subtitle">Malolos, Bulacan · Dispatch decision-support prototype</p>
+      </div>
+
+      <div className="login-form-wrap">
+        <form className="login-form" onSubmit={signIn}>
+          <div className="login-input-row">
+            <label className="login-field login-field-compact">
+              <span>Demo account</span>
+              <select aria-label="Demo account" value={activeUserId} onChange={(event) => setActiveUserId(event.target.value)}>
+                {demoUsers.map((user) => <option key={user.id} value={user.id}>{user.name} · {user.role}</option>)}
+              </select>
+            </label>
+
+            <label className="login-field login-field-compact">
+              <span>Password</span>
+              <input aria-label="Password" type="password" autoComplete="current-password" value={loginPassword} onChange={(event) => setLoginPassword(event.target.value)} placeholder="Enter demo password" required />
+            </label>
+          </div>
+
+          {loginError && <p className="login-error" role="alert">{loginError}</p>}
+
+          <button className="button-primary login-submit" type="submit">
+            Sign in <ArrowUpRight size={16} />
+          </button>
+        </form>
+
+        <div className="login-meta">
+          <p className="login-hint"><strong>Demo password:</strong> demo123</p>
+          <p className="login-disclaimer">Demo-only login. Accounts and role permissions are stored locally and are not secure authentication.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
   return <div className="app-shell">
     {sidebarOpen && <button className="mobile-scrim" aria-label="Close navigation" onClick={() => setSidebarOpen(false)} />}
     <aside className={`sidebar ${sidebarOpen ? 'sidebar-open' : ''}`}><div className="brand"><div className="brand-mark"><Activity size={21} /></div><div><p className="brand-kicker">MALOLOS · BULACAN</p><h2>Flood Dispatch</h2></div><button className="mobile-close" aria-label="Close navigation" onClick={() => setSidebarOpen(false)}><X size={20} /></button></div>
       <div className="sidebar-section"><span className="sidebar-label">WORKSPACE</span><nav className="nav">{navItems.map(({ id, label, icon: Icon }) => <button key={id} className={`nav-item ${activePage === id ? 'active' : ''}`} onClick={() => { setActivePage(id); setSidebarOpen(false) }}><Icon size={17} /><span>{label}</span>{id === 'incidents' && openIncidents > 0 && <span className="nav-count">{openIncidents}</span>}</button>)}</nav></div>
       <div className="sidebar-bottom"><div className="alert-level"><span className="alert-level-dot" /><div><small>OPERATIONAL STATUS</small><strong>{error ? 'Service issue' : isDemoMode ? 'Demo simulation' : 'Monitoring active'}</strong></div></div><div className="sidebar-foot"><span>Flood response support</span><span>Prototype · Local data</span></div></div>
     </aside>
-    <main className="main-panel"><header className="topbar"><div className="topbar-title"><button className="mobile-menu" aria-label="Open navigation" aria-expanded={sidebarOpen} onClick={() => setSidebarOpen(true)}><Menu size={19} /></button><div><div className="breadcrumb">Operations <span>/</span> {pageTitle}</div><h1>{pageTitle}</h1></div></div><div className="topbar-tools"><label className="role-picker light-role-picker"><span>Demo profile</span><select aria-label="Switch demo profile" value={activeUser?.id || ''} onChange={(event) => changeActiveUser(event.target.value)}>{demoUsers.map((user) => <option key={user.id} value={user.id}>{user.name} · {user.role}</option>)}</select></label><button className="icon-button notification-button" title="Notifications" aria-label={`Notifications, ${notifications.filter((item) => !item.read).length} unread`} aria-expanded={notificationsOpen} onClick={toggleNotifications}><Bell size={18} />{notifications.some((item) => !item.read) && <i />}</button><button className="icon-button" title="Refresh data" aria-label="Refresh data" onClick={refresh}><RefreshCw size={18} /></button></div></header>
+    <main className="main-panel"><header className="topbar"><div className="topbar-title"><button className="mobile-menu" aria-label="Open navigation" aria-expanded={sidebarOpen} onClick={() => setSidebarOpen(true)}><Menu size={19} /></button><div><div className="breadcrumb">Operations <span>/</span> {pageTitle}</div><h1>{pageTitle}</h1></div></div><div className="topbar-tools"><label className="role-picker light-role-picker"><span>Demo profile</span><select aria-label="Switch demo profile" value={activeUser?.id || ''} onChange={(event) => changeActiveUser(event.target.value)}>{demoUsers.map((user) => <option key={user.id} value={user.id}>{user.name} · {user.role}</option>)}</select></label><button className="icon-button notification-button" title="Notifications" aria-label={`Notifications, ${notifications.filter((item) => !item.read).length} unread`} aria-expanded={notificationsOpen} onClick={toggleNotifications}><Bell size={18} />{notifications.some((item) => !item.read) && <i />}</button><button className="icon-button" title="Refresh data" aria-label="Refresh data" onClick={refresh}><RefreshCw size={18} /></button><button className="icon-button" title="Sign out" aria-label="Sign out" onClick={signOut}><LogOut size={17} /></button></div></header>
       {notificationsOpen && <aside className="notification-panel" aria-label="Notification center"><div className="panel-header"><div><h3>Notification center</h3><p className="panel-subtitle">Local prototype alerts</p></div><button className="icon-button" aria-label="Close notifications" onClick={() => setNotificationsOpen(false)}><X size={16} /></button></div>{notifications.map((notification) => <article className={`notification-item ${notification.read ? 'read' : ''}`} key={notification.notification_id}><span className="activity-marker" /><div><strong>{notification.title}</strong><p>{notification.message}</p><time>{notification.time}</time></div></article>)}{!notifications.length && <p className="empty-state">No notifications.</p>}</aside>}
       {isDemoMode && <div className="prototype-notice"><AlertTriangle size={14} /> Prototype mode: profiles and permissions are simulated locally; this is not secure authentication.</div>}
       <div className="page-content">{loading ? <div className="loading-state">Loading prototype data...</div> : pageContent()}<footer className="page-footer"><span>Decision support prototype · Final dispatch decisions remain with authorized coordinators.</span><button onClick={() => setNotice('All prototype changes are stored in this browser only')}>Prototype information</button></footer></div>
@@ -583,9 +665,9 @@ function NetworkMap({ roads, roadGeometries, incidents, nodes, highlightedEdgeId
       if (!positions) return null
       const isRecommended = highlighted.has(String(road.id))
       return <Polyline key={road.id} positions={positions} pathOptions={{
-        color: road.condition === 'Blocked' ? '#d3534b' : isRecommended ? '#db8b32' : '#137c8b',
+        color: road.condition === 'Impassable' ? '#d3534b' : isRecommended ? '#db8b32' : '#137c8b',
         weight: isRecommended ? 7 : 4,
-        dashArray: road.condition === 'Blocked' ? '8 8' : undefined,
+        dashArray: road.condition === 'Impassable' ? '8 8' : undefined,
       }} />
     })}
     {incidents.map((incident) => <CircleMarker key={incident.id} center={incident.location} radius={incident.priority === 'Critical' ? 9 : 7} pathOptions={{ color: '#fff', weight: 2, fillColor: incident.priority === 'Critical' ? '#d94e48' : '#e4a335', fillOpacity: 1 }}>

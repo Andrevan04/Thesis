@@ -1,35 +1,41 @@
-<<<<<<< HEAD
-const express = require('express')
+﻿const express = require('express')
 const cors = require('cors')
 const dotenv = require('dotenv')
-const { Pool } = require('pg')
 const fs = require('node:fs')
 const path = require('node:path')
+const { Pool } = require('pg')
 const { createRoadGraph, shortestPath, recommendAssignments } = require('./optimization')
-=======
-
-const fs = require("fs");
-
-const express = require("express");
-const { Pool } = require("pg");
-const cors = require("cors");
-require("dotenv").config();
->>>>>>> f532678074763ced8a761a063a8372a83c0d87da
 
 dotenv.config()
 
 const app = express()
 const PORT = Number(process.env.PORT) || 5000
-const poolOptions = { connectionString: process.env.DATABASE_URL }
+const hasDatabaseConfig = Boolean(process.env.DATABASE_URL || process.env.DB_HOST)
+const poolOptions = {}
 
-<<<<<<< HEAD
-if (process.env.PGSSLROOTCERT) {
-  const databaseUrl = new URL(process.env.DATABASE_URL)
-  databaseUrl.searchParams.delete('sslmode')
-  poolOptions.connectionString = databaseUrl.toString()
-  poolOptions.ssl = {
-    ca: fs.readFileSync(path.resolve(process.env.PGSSLROOTCERT), 'utf8'),
-    rejectUnauthorized: true,
+if (process.env.DATABASE_URL) {
+  poolOptions.connectionString = process.env.DATABASE_URL
+  if (process.env.PGSSLROOTCERT) {
+    const databaseUrl = new URL(process.env.DATABASE_URL)
+    databaseUrl.searchParams.delete('sslmode')
+    poolOptions.connectionString = databaseUrl.toString()
+    poolOptions.ssl = {
+      ca: fs.readFileSync(path.resolve(process.env.PGSSLROOTCERT), 'utf8'),
+      rejectUnauthorized: true,
+    }
+  }
+} else if (process.env.DB_HOST) {
+  poolOptions.user = process.env.DB_USER
+  poolOptions.password = process.env.DB_PASSWORD
+  poolOptions.host = process.env.DB_HOST
+  poolOptions.port = Number(process.env.DB_PORT || 5432)
+  poolOptions.database = process.env.DB_NAME
+
+  if (process.env.DB_SSL_CA) {
+    poolOptions.ssl = {
+      rejectUnauthorized: true,
+      ca: fs.readFileSync(path.resolve(process.env.DB_SSL_CA), 'utf8'),
+    }
   }
 }
 
@@ -40,6 +46,19 @@ app.use(express.json())
 
 const asyncRoute = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next)
 const positiveId = (value) => /^\d+$/.test(String(value)) && Number(value) > 0
+const requireDatabase = asyncRoute(async (_req, res, next) => {
+  if (!hasDatabaseConfig) {
+    return res.status(503).json({ message: 'Database configuration is not available for this backend instance.' })
+  }
+
+  try {
+    await pool.query('SELECT 1')
+    next()
+  } catch (error) {
+    next(error)
+  }
+})
+
 const tableList = (table, columns, orderBy) => asyncRoute(async (_req, res) => {
   const { rows } = await pool.query(`SELECT ${columns} FROM ${table} ORDER BY ${orderBy}`)
   res.json(rows)
@@ -57,6 +76,7 @@ const loadRoadNetwork = async (database) => {
     database.query('SELECT node_id, latitude, longitude FROM road_node'),
     database.query('SELECT edge_id, from_node_id, to_node_id, is_passable FROM road_edge'),
   ])
+
   return {
     nodes: nodeResult.rows,
     edges: edgeResult.rows,
@@ -65,17 +85,21 @@ const loadRoadNetwork = async (database) => {
 }
 
 app.get('/api/health', asyncRoute(async (_req, res) => {
+  if (!hasDatabaseConfig) {
+    return res.json({ status: 'ok', database: 'not-configured' })
+  }
+
   await pool.query('SELECT 1')
   res.json({ status: 'ok', database: 'postgresql' })
 }))
 
-app.get('/api/incidents', tableList(
+app.get('/api/incidents', requireDatabase, tableList(
   'incident i LEFT JOIN road_node n ON n.node_id = i.location_node_id',
   'i.incident_id, i.reported_by, i.location_node_id, i.people_affected, i.urgency_level, i.status, n.node_type, n.latitude, n.longitude',
   'i.incident_id DESC',
 ))
 
-app.post('/api/incidents', asyncRoute(async (req, res) => {
+app.post('/api/incidents', requireDatabase, asyncRoute(async (req, res) => {
   const { location_node_id, people_affected, urgency_level, reported_by, status = 'Pending' } = req.body
   if (!positiveId(location_node_id) || !positiveId(people_affected) || !positiveId(reported_by) || !['Critical', 'High', 'Medium', 'Low'].includes(urgency_level)) {
     return res.status(400).json({ message: 'location_node_id, people_affected, reported_by, and a valid urgency_level are required' })
@@ -99,13 +123,13 @@ app.post('/api/incidents', asyncRoute(async (req, res) => {
   }
 }))
 
-app.get('/api/units', tableList(
+app.get('/api/units', requireDatabase, tableList(
   'rescue_unit u LEFT JOIN road_node n ON n.node_id = u.current_node_id',
   'u.unit_id, u.current_node_id, u.capacity, u.status, n.node_type, n.latitude, n.longitude',
   'u.unit_id',
 ))
 
-app.patch('/api/units/:id', asyncRoute(async (req, res) => {
+app.patch('/api/units/:id', requireDatabase, asyncRoute(async (req, res) => {
   const { status } = req.body
   if (!positiveId(req.params.id)) return res.status(400).json({ message: 'Unit id must be a positive integer' })
   if (!['Available', 'Assigned'].includes(status)) return res.status(400).json({ message: 'Status must be Available or Assigned' })
@@ -132,19 +156,19 @@ app.patch('/api/units/:id', asyncRoute(async (req, res) => {
   }
 }))
 
-app.get('/api/roads/nodes', tableList(
+app.get('/api/roads/nodes', requireDatabase, tableList(
   'road_node',
   'node_id, node_type, latitude, longitude',
   'node_id',
 ))
 
-app.get('/api/roads/edges', tableList(
+app.get('/api/roads/edges', requireDatabase, tableList(
   'road_edge',
   'edge_id, from_node_id, to_node_id, is_passable',
   'edge_id',
 ))
 
-app.patch('/api/roads/edges/:id', asyncRoute(async (req, res) => {
+app.patch('/api/roads/edges/:id', requireDatabase, asyncRoute(async (req, res) => {
   const { is_passable } = req.body
   if (!positiveId(req.params.id)) return res.status(400).json({ message: 'Edge id must be a positive integer' })
   if (typeof is_passable !== 'boolean') return res.status(400).json({ message: 'is_passable must be a boolean' })
@@ -171,7 +195,7 @@ app.patch('/api/roads/edges/:id', asyncRoute(async (req, res) => {
   }
 }))
 
-app.get('/api/dispatches', asyncRoute(async (_req, res) => {
+app.get('/api/dispatches', requireDatabase, asyncRoute(async (_req, res) => {
   const { rows } = await pool.query(`
     SELECT d.dispatch_id, d.unit_id, d.incident_id, d.assigned_by,
       i.urgency_level, i.status AS incident_status,
@@ -190,22 +214,24 @@ app.get('/api/dispatches', asyncRoute(async (_req, res) => {
   res.json({ dispatches: rows })
 }))
 
-app.get('/api/dispatches/recommendations', asyncRoute(async (_req, res) => {
+app.get('/api/dispatches/recommendations', requireDatabase, asyncRoute(async (_req, res) => {
   const [unitResult, incidentResult, network] = await Promise.all([
     pool.query("SELECT unit_id, current_node_id, capacity, status FROM rescue_unit WHERE status = 'Available' ORDER BY unit_id"),
     pool.query("SELECT incident_id, location_node_id, people_affected, urgency_level, status FROM incident WHERE status = 'Pending' ORDER BY incident_id"),
     loadRoadNetwork(pool),
   ])
+
   const result = recommendAssignments({
     units: unitResult.rows,
     incidents: incidentResult.rows,
     nodes: network.nodes,
     edges: network.edges,
   })
+
   res.json(result)
 }))
 
-app.post('/api/dispatches', asyncRoute(async (req, res) => {
+app.post('/api/dispatches', requireDatabase, asyncRoute(async (req, res) => {
   const { unit_id, incident_id, assigned_by } = req.body
   if (![unit_id, incident_id, assigned_by].every(positiveId)) {
     return res.status(400).json({ message: 'unit_id, incident_id, and assigned_by must be positive integers' })
@@ -216,10 +242,12 @@ app.post('/api/dispatches', asyncRoute(async (req, res) => {
     await client.query('BEGIN')
     const { rows: units } = await client.query('SELECT current_node_id, status FROM rescue_unit WHERE unit_id = $1 FOR UPDATE', [Number(unit_id)])
     const { rows: incidents } = await client.query('SELECT location_node_id, status FROM incident WHERE incident_id = $1 FOR UPDATE', [Number(incident_id)])
+
     if (!units.length || !incidents.length) {
       await client.query('ROLLBACK')
       return res.status(404).json({ message: !units.length ? 'Rescue unit not found' : 'Incident not found' })
     }
+
     if (units[0].status !== 'Available' || incidents[0].status !== 'Pending') {
       await client.query('ROLLBACK')
       return res.status(409).json({ message: 'The rescue unit or incident is no longer available for dispatch' })
@@ -240,10 +268,12 @@ app.post('/api/dispatches', asyncRoute(async (req, res) => {
       'INSERT INTO route (dispatch_id, total_distance) VALUES ($1, $2) RETURNING route_id, dispatch_id, total_distance',
       [dispatchRows[0].dispatch_id, path.distanceKm],
     )
+
     await client.query('UPDATE rescue_unit SET status = $1 WHERE unit_id = $2', ['Assigned', Number(unit_id)])
     await client.query('UPDATE incident SET status = $1 WHERE incident_id = $2', ['Assigned', Number(incident_id)])
     await createLog(client, Number(assigned_by), `Created dispatch ${dispatchRows[0].dispatch_id}`)
     await client.query('COMMIT')
+
     res.status(201).json({ dispatch: { ...dispatchRows[0], route: routeRows[0], status: 'Assigned' } })
   } catch (error) {
     await client.query('ROLLBACK')
@@ -253,7 +283,7 @@ app.post('/api/dispatches', asyncRoute(async (req, res) => {
   }
 }))
 
-app.get('/api/logs', asyncRoute(async (_req, res) => {
+app.get('/api/logs', requireDatabase, asyncRoute(async (_req, res) => {
   const { rows } = await pool.query(
     'SELECT log_id, user_id, action_type FROM system_log ORDER BY log_id DESC LIMIT 100',
   )
@@ -273,9 +303,15 @@ app.use((error, _req, res, _next) => {
 app.use((_req, res) => res.status(404).json({ message: 'API route not found' }))
 
 const startServer = async () => {
-  if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required')
-  await pool.query('SELECT 1')
-  app.listen(PORT, () => console.log(`Flood dispatch API listening on port ${PORT}`))
+  if (hasDatabaseConfig) {
+    await pool.query('SELECT 1')
+    app.listen(PORT, () => console.log(`Flood dispatch API listening on port ${PORT}`))
+    return
+  }
+
+  app.listen(PORT, () => {
+    console.log(`Flood dispatch API listening on port ${PORT} without a configured database`)
+  })
 }
 
 startServer().catch((error) => {
@@ -292,240 +328,3 @@ process.on('SIGTERM', async () => {
   await pool.end()
   process.exit(0)
 })
-=======
-// ===============================
-// PostgreSQL Connection
-// ===============================
-
-const pool = new Pool({
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  host: process.env.DB_HOST,
-  port: Number(process.env.DB_PORT),
-  database: process.env.DB_NAME,
-  ssl: {
-    rejectUnauthorized: true,
-    ca: fs.readFileSync("./ca.pem").toString()
-  }
-});
-
-// ===============================
-// Basic Test Route
-// ===============================
-
-app.get("/", (req, res) => {
-  res.json({
-    message: "Server is running!"
-  });
-});
-
-// ===============================
-// Test Database Connection
-// ===============================
-
-app.get("/api/test-db", async (req, res) => {
-  try {
-    const result = await pool.query("SELECT NOW()");
-
-    res.json({
-      message: "PostgreSQL connected!",
-      time: result.rows[0].now
-    });
-  } catch (error) {
-    console.error("Database error:", error);
-
-    res.status(500).json({
-      message: "Database connection failed"
-    });
-  }
-});
-
-// ===============================
-// GET INCIDENTS
-// ===============================
-
-app.get("/api/test-route", (req, res) => {
-  res.json({
-    message: "TEST ROUTE IS WORKING"
-  });
-});
-
-app.get("/api/test-db-2", async (req, res) => {
-  try {
-    const result = await pool.query("SELECT 1 AS test");
-
-    res.json({
-      message: "Database query works!",
-      result: result.rows
-    });
-  } catch (error) {
-    console.error("DATABASE ERROR:", error);
-
-    res.status(500).json({
-      message: "Database query failed",
-      error: error.message,
-      code: error.code
-    });
-  }
-});
-
-app.get("/api/incidents", async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT *
-      FROM incident
-      ORDER BY incident_id DESC
-    `);
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error("Error fetching incidents:", error);
-
-    res.status(500).json({
-      message: "Failed to fetch incidents"
-    });
-  }
-});
-
-app.get("/api/nodes", async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT *
-      FROM road_node
-      ORDER BY node_id
-    `);
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error("Error fetching road nodes:", error);
-
-    res.status(500).json({
-      message: "Failed to fetch road nodes",
-      error: error.message
-    });
-  }
-});
-
-
-
-// ===============================
-// GET RESCUE UNITS
-// ===============================
-
-app.get("/api/units", async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT *
-      FROM rescue_unit
-      ORDER BY unit_id
-    `);
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error("Error fetching rescue units:", error);
-
-    res.status(500).json({
-      message: "Failed to fetch rescue units"
-    });
-  }
-});
-
-// ===============================
-// GET ROAD NODES
-// ===============================
-
-app.get("/api/incidents", async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT *
-      FROM incident
-      ORDER BY incident_id DESC
-    `);
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error("Error fetching incidents:", error);
-
-    res.status(500).json({
-      message: "Failed to fetch incidents",
-      error: error.message
-    });
-  }
-});
-
-// ===============================
-// GET ROAD EDGES
-// ===============================
-
-app.get("/api/edges", async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT *
-      FROM road_edge
-      ORDER BY edge_id
-    `);
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error("Error fetching road edges:", error);
-
-    res.status(500).json({
-      message: "Failed to fetch road edges"
-    });
-  }
-});
-
-// ===============================
-// GET DISPATCHES
-// ===============================
-
-app.get("/api/dispatches", async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT *
-      FROM dispatch
-      ORDER BY dispatch_id DESC
-    `);
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error("Error fetching dispatches:", error);
-
-    res.status(500).json({
-      message: "Failed to fetch dispatches"
-    });
-  }
-});
-
-// ===============================
-// GET SYSTEM LOGS
-// ===============================
-
-app.get("/api/logs", async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT *
-      FROM system_log
-      ORDER BY log_id DESC
-    `);
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error("Error fetching system logs:", error);
-
-    res.status(500).json({
-      message: "Failed to fetch system logs"
-    });
-  }
-});
-
-// ===============================
-// Start Server
-// ===============================
-
-const PORT = process.env.PORT || 5000;
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running on port ${PORT}`);
-});
->>>>>>> f532678074763ced8a761a063a8372a83c0d87da

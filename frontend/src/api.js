@@ -298,7 +298,7 @@ const normalizeRoad = (edge, nodes) => {
     id: String(getId(edge) ?? ''),
     name: value(edge, 'name', 'road_name') || `Road edge ${getId(edge)}`,
     segment: `${fromId ?? '?'} → ${toId ?? '?'}`,
-    condition: passable === false ? 'Blocked' : passable === true ? 'Open' : 'Unknown',
+    condition: passable === false ? 'Impassable' : passable === true ? 'Passable' : 'Unknown',
     depth: 'Not recorded',
     updated: value(edge, 'updated', 'updated_at') || '—',
     from,
@@ -440,16 +440,16 @@ export const updateRoad = async (id, condition) => {
     const data = readDemoData()
     const edge = data.edges.find((item) => String(item.edge_id) === String(id))
     if (!edge) throw new Error('Road edge not found')
-    edge.is_passable = condition !== 'Blocked'
+    edge.is_passable = condition === 'Passable'
     addDemoLog(data, DEFAULT_USER_ID, `Updated road edge ${id} passability to ${edge.is_passable}`)
-    addDemoNotification(data, edge.is_passable ? 'Road reopened' : 'Road marked impassable', `Road edge ${id} is ${edge.is_passable ? 'passable' : 'closed'} for dispatch routes.`)
+    addDemoNotification(data, edge.is_passable ? 'Road marked passable' : 'Road marked impassable', `Road edge ${id} is ${edge.is_passable ? 'passable' : 'impassable'} for dispatch routes.`)
     writeDemoData(data)
     return edge
   }
   const body = await request(`/roads/edges/${id}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ is_passable: condition !== 'Blocked', updated_by: DEFAULT_USER_ID }),
+    body: JSON.stringify({ is_passable: condition === 'Passable', updated_by: DEFAULT_USER_ID }),
   })
   return body.edge || body
 }
