@@ -6,6 +6,7 @@ const prioritiesForEvaluation = ['Critical', 'High', 'Medium', 'Low']
 const USE_DEMO_DATA = import.meta.env.VITE_DEMO_MODE !== 'false'
 const DEMO_STORAGE_KEY = 'flood-dispatch-demo-data'
 const INCIDENT_BARANGAY_KEY = 'flood-dispatch-incident-barangays'
+const BARANGAY_COORDINATE_KEY = 'flood-dispatch-barangay-coordinates'
 let demoMode = false
 const roadGeometryCache = new Map()
 
@@ -24,10 +25,10 @@ const createDemoData = () => ({
     { incident_id: 4, reported_by: 2, location_node_id: 2, people_affected: 2, barangay: 'Atlag', urgency_level: 'Low', status: 'Resolved' },
   ],
   units: [
-    { unit_id: 1, current_node_id: 1, capacity: 10, status: 'Available' },
-    { unit_id: 2, current_node_id: 5, capacity: 8, status: 'Assigned' },
-    { unit_id: 3, current_node_id: 2, capacity: 6, status: 'Available' },
-    { unit_id: 4, current_node_id: 4, capacity: 12, status: 'Available' },
+    { unit_id: 1, name: 'Rescue Unit 1', type: 'Ambulance', current_node_id: 1, capacity: 10, status: 'Available' },
+    { unit_id: 2, name: 'Rescue Unit 2', type: 'Rescue boat', current_node_id: 5, capacity: 8, status: 'Deployed' },
+    { unit_id: 3, name: 'Rescue Unit 3', type: 'Rescue truck', current_node_id: 2, capacity: 6, status: 'Available' },
+    { unit_id: 4, name: 'Rescue Unit 4', type: 'Rescue boat', current_node_id: 4, capacity: 12, status: 'Available' },
   ],
   edges: [
     { edge_id: 1, from_node_id: 1, to_node_id: 2, is_passable: true },
@@ -65,6 +66,10 @@ const readDemoData = () => {
           ...initial.incidents.find((item) => item.incident_id === Number(incident.incident_id)),
           ...incident,
           people_affected: incident.people_affected ?? 1,
+        })),
+        units: saved.units.map((unit) => ({
+          ...initial.units.find((item) => item.unit_id === Number(unit.unit_id)),
+          ...unit,
         })),
         dispatches: Array.isArray(saved.dispatches) ? saved.dispatches.map((dispatch) => {
           const initialDispatch = initial.dispatches.find((item) => item.dispatch_id === Number(dispatch.dispatch_id))
@@ -251,6 +256,16 @@ const listFrom = (body, ...keys) => {
 
 const value = (record, ...keys) => keys.map((key) => record?.[key]).find((item) => item !== undefined && item !== null)
 const getId = (record) => value(record, 'id', 'incident_id', 'unit_id', 'node_id', 'edge_id', 'dispatch_id', 'route_id', 'log_id')
+const distanceBetweenNodesKm = (first, second) => {
+  const radians = (degrees) => degrees * Math.PI / 180
+  const latitude1 = radians(Number(first.latitude))
+  const latitude2 = radians(Number(second.latitude))
+  const latitudeDelta = latitude2 - latitude1
+  const longitudeDelta = radians(Number(second.longitude) - Number(first.longitude))
+  const haversine = Math.sin(latitudeDelta / 2) ** 2
+    + Math.cos(latitude1) * Math.cos(latitude2) * Math.sin(longitudeDelta / 2) ** 2
+  return 6371 * 2 * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine))
+}
 
 const normalizeIncident = (incident, nodes, barangayLabels = {}) => {
   const nodeId = value(incident, 'location_node_id', 'locationNodeId')
@@ -274,6 +289,12 @@ const normalizeIncident = (incident, nodes, barangayLabels = {}) => {
 const normalizeUnit = (unit, nodes) => {
   const nodeId = value(unit, 'current_node_id', 'currentNodeId')
   const node = nodes.find((item) => String(getId(item)) === String(nodeId))
+  const rawStatus = String(value(unit, 'status') || 'Unknown').toLowerCase().replaceAll('_', ' ')
+  const status = rawStatus === 'assigned' || rawStatus === 'deployed'
+    ? 'Deployed'
+    : rawStatus === 'under maintenance' || rawStatus === 'maintenance'
+      ? 'Under maintenance'
+      : rawStatus === 'available' ? 'Available' : 'Unknown'
 
   return {
     ...unit,
@@ -281,7 +302,7 @@ const normalizeUnit = (unit, nodes) => {
     name: value(unit, 'name', 'unit_name') || `Rescue Unit ${getId(unit)}`,
     type: value(unit, 'type', 'unit_type') || 'Rescue unit',
     capacity: value(unit, 'capacity') ?? '—',
-    status: value(unit, 'status') || 'Unknown',
+    status,
     location: node ? [Number(value(node, 'latitude')), Number(value(node, 'longitude'))] : [14.846, 120.811],
   }
 }
@@ -292,6 +313,8 @@ const normalizeRoad = (edge, nodes) => {
   const from = nodes.find((item) => String(getId(item)) === String(fromId))
   const to = nodes.find((item) => String(getId(item)) === String(toId))
   const passable = value(edge, 'is_passable', 'isPassable')
+  const storedDistance = value(edge, 'distance_km', 'distanceKm', 'distance')
+  const hasCoordinates = [from?.latitude, from?.longitude, to?.latitude, to?.longitude].every((coordinate) => Number.isFinite(Number(coordinate)))
 
   return {
     ...edge,
@@ -299,6 +322,8 @@ const normalizeRoad = (edge, nodes) => {
     name: value(edge, 'name', 'road_name') || `Road edge ${getId(edge)}`,
     segment: `${fromId ?? '?'} → ${toId ?? '?'}`,
     condition: passable === false ? 'Impassable' : passable === true ? 'Passable' : 'Unknown',
+    distanceKm: storedDistance ?? (hasCoordinates ? distanceBetweenNodesKm(from, to) : null),
+    distanceEstimated: storedDistance == null && hasCoordinates,
     depth: 'Not recorded',
     updated: value(edge, 'updated', 'updated_at') || '—',
     from,
@@ -311,23 +336,30 @@ const normalizeDispatch = (dispatch, incidents = [], units = []) => {
   const incidentId = value(dispatch, 'incident_id', 'incidentId')
   const unitId = value(dispatch, 'unit_id', 'unitId')
   const route = dispatch.route || dispatch.routes?.[0] || dispatch
+  const incidentStatus = value(dispatch, 'incident_status', 'incidentStatus')
+  const dispatchStatus = value(dispatch, 'dispatch_status', 'status')
+    || (incidentStatus === 'In Progress' ? 'En route' : incidentStatus === 'Resolved' ? 'Completed' : incidentStatus === 'Assigned' ? 'Assigned' : 'Dispatched')
+  const routeStatus = value(dispatch, 'route_status', 'routeStatus') || value(route, 'status', 'route_status') || 'Active'
 
   return {
     id: `DISPATCH-${id}`,
     dispatchId: String(id ?? ''),
     createdAt: value(dispatch, 'created_at', 'createdAt') || '—',
-    status: value(dispatch, 'status') || 'Dispatched',
+    status: dispatchStatus,
+    routeStatus,
     assignments: [{
       incidentId: String(incidentId ?? '—'),
       barangay: value(dispatch, 'barangay') || incidents.find((item) => item.id === String(incidentId))?.barangay || `Incident ${incidentId ?? '—'}`,
       unitId: String(unitId ?? '—'),
       unitName: value(dispatch, 'unit_name', 'unitName') || units.find((item) => item.id === String(unitId))?.name || `Unit ${unitId ?? '—'}`,
-      eta: value(route, 'total_distance', 'totalDistance') != null ? `${Number(value(route, 'total_distance', 'totalDistance')).toFixed(2)} km` : '—',
+      eta: routeStatus === 'Unreachable'
+        ? '—'
+        : value(route, 'total_distance', 'totalDistance') != null ? `${Number(value(route, 'total_distance', 'totalDistance')).toFixed(2)} km` : '—',
       priority: value(dispatch, 'urgency_level', 'urgencyLevel', 'priority') || '—',
       route: value(route, 'route_id', 'routeId') || 'Route recorded',
-      distanceKm: value(route, 'total_distance', 'totalDistance') ?? null,
-      nodeIds: value(route, 'node_ids', 'nodeIds') || [],
-      edgeIds: value(route, 'edge_ids', 'edgeIds') || [],
+      distanceKm: routeStatus === 'Unreachable' ? null : value(route, 'total_distance', 'totalDistance') ?? null,
+      nodeIds: routeStatus === 'Unreachable' ? [] : value(route, 'node_ids', 'nodeIds') || [],
+      edgeIds: routeStatus === 'Unreachable' ? [] : value(route, 'edge_ids', 'edgeIds') || [],
     }],
   }
 }
@@ -336,10 +368,55 @@ const normalizeLog = (log) => ({
   id: String(getId(log) ?? ''),
   time: value(log, 'time', 'created_at', 'createdAt') || '—',
   text: value(log, 'action_type', 'actionType', 'text') || 'System action',
-  actor: value(log, 'user_name', 'userName', 'user_id', 'userId') != null
-    ? `User ${value(log, 'user_name', 'userName', 'user_id', 'userId')}`
-    : 'System',
+  actor: value(log, 'user_name', 'userName') || '',
+  userId: value(log, 'user_id', 'userId'),
 })
+
+export const resolveBarangayNodeId = async (barangay, nodes) => {
+  const nodeCoordinates = nodes.map((node) => ({
+    id: value(node, 'node_id', 'nodeId', 'id'),
+    latitude: Number(value(node, 'latitude')),
+    longitude: Number(value(node, 'longitude')),
+  })).filter((node) => node.id != null && Number.isFinite(node.latitude) && Number.isFinite(node.longitude))
+  if (!nodeCoordinates.length) throw new Error('No road-network nodes are available for location matching')
+
+  let coordinates = null
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(BARANGAY_COORDINATE_KEY) || '{}')
+    coordinates = saved[barangay] || null
+  } catch {
+    coordinates = null
+  }
+
+  if (!coordinates) {
+    const query = encodeURIComponent(`${barangay}, Malolos, Bulacan, Philippines`)
+    const response = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=ph&q=${query}`, {
+      headers: { Accept: 'application/json' },
+    })
+    if (!response.ok) throw new Error('Could not locate the selected barangay. Try again when the map service is available.')
+    const results = await response.json()
+    if (!results[0]) throw new Error('Could not locate the selected barangay. Check the selected barangay and try again.')
+    coordinates = { latitude: Number(results[0].lat), longitude: Number(results[0].lon) }
+    if (!Number.isFinite(coordinates.latitude) || !Number.isFinite(coordinates.longitude)) {
+      throw new Error('The map service returned an invalid location for this barangay. Try again.')
+    }
+    try {
+      const saved = JSON.parse(window.localStorage.getItem(BARANGAY_COORDINATE_KEY) || '{}')
+      window.localStorage.setItem(BARANGAY_COORDINATE_KEY, JSON.stringify({ ...saved, [barangay]: coordinates }))
+    } catch {
+      // Geocoding can still be used for this request without browser storage.
+    }
+  }
+
+  const radians = (degrees) => degrees * Math.PI / 180
+  const distanceSquared = (node) => {
+    const latitudeDelta = radians(node.latitude - coordinates.latitude)
+    const longitudeDelta = radians(node.longitude - coordinates.longitude)
+    const latitude = radians(coordinates.latitude)
+    return latitudeDelta ** 2 + Math.cos(latitude) ** 2 * longitudeDelta ** 2
+  }
+  return String(nodeCoordinates.reduce((nearest, node) => distanceSquared(node) < distanceSquared(nearest) ? node : nearest).id)
+}
 
 export const loadDashboard = async () => {
   if (USE_DEMO_DATA) {
@@ -417,6 +494,7 @@ export const createIncident = async ({ urgency_level, location_node_id, people_a
 }
 
 export const updateUnit = async (id, status) => {
+  if (!['Available', 'Deployed', 'Under maintenance'].includes(status)) throw new Error('Invalid rescue unit status')
   if (demoMode) {
     const data = readDemoData()
     const unit = data.units.find((item) => String(item.unit_id) === String(id))
@@ -441,17 +519,45 @@ export const updateRoad = async (id, condition) => {
     const edge = data.edges.find((item) => String(item.edge_id) === String(id))
     if (!edge) throw new Error('Road edge not found')
     edge.is_passable = condition === 'Passable'
+    const reroutedDispatchIds = []
+    const unreachableDispatchIds = []
+    for (const dispatch of data.dispatches) {
+      if (!['Assigned', 'En route'].includes(dispatch.status)) continue
+      const routeStatus = dispatch.route?.status || 'Active'
+      const routeEdgeIds = dispatch.route?.edge_ids || []
+      if (routeStatus !== 'Unreachable' && routeEdgeIds.length && !routeEdgeIds.map(String).includes(String(id))) continue
+
+      const unit = data.units.find((item) => Number(item.unit_id) === Number(dispatch.unit_id))
+      const incident = data.incidents.find((item) => Number(item.incident_id) === Number(dispatch.incident_id))
+      if (!unit || !incident) continue
+      const path = demoShortestPath(data, unit.current_node_id, incident.location_node_id)
+      dispatch.route = {
+        ...dispatch.route,
+        total_distance: path?.distanceKm ?? 0,
+        node_ids: path?.nodeIds || [],
+        edge_ids: path?.edgeIds || [],
+        status: path ? 'Active' : 'Unreachable',
+      }
+      if (path) reroutedDispatchIds.push(String(dispatch.dispatch_id))
+      else unreachableDispatchIds.push(String(dispatch.dispatch_id))
+      addDemoLog(data, DEFAULT_USER_ID, path
+        ? `Re-optimized route for dispatch ${dispatch.dispatch_id}`
+        : `No passable route for dispatch ${dispatch.dispatch_id}`)
+    }
     addDemoLog(data, DEFAULT_USER_ID, `Updated road edge ${id} passability to ${edge.is_passable}`)
     addDemoNotification(data, edge.is_passable ? 'Road marked passable' : 'Road marked impassable', `Road edge ${id} is ${edge.is_passable ? 'passable' : 'impassable'} for dispatch routes.`)
+    if (reroutedDispatchIds.length || unreachableDispatchIds.length) {
+      addDemoNotification(data, 'Active routes re-optimized', `${reroutedDispatchIds.length} route(s) updated; ${unreachableDispatchIds.length} dispatch(es) have no passable path.`)
+    }
     writeDemoData(data)
-    return edge
+    return { edge, reroutedDispatchIds, unreachableDispatchIds }
   }
   const body = await request(`/roads/edges/${id}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ is_passable: condition === 'Passable', updated_by: DEFAULT_USER_ID }),
   })
-  return body.edge || body
+  return body
 }
 
 export const createDispatch = async ({ unit_id, incident_id, assigned_by, distanceKm, nodeIds, edgeIds }) => {
@@ -466,10 +572,10 @@ export const createDispatch = async ({ unit_id, incident_id, assigned_by, distan
       incident_id: Number(incident_id),
       assigned_by: Number(assigned_by ?? DEFAULT_USER_ID),
       status: 'Assigned',
-      route: { total_distance: distanceKm, node_ids: nodeIds, edge_ids: edgeIds },
+      route: { total_distance: distanceKm, node_ids: nodeIds, edge_ids: edgeIds, status: 'Active' },
     }
     data.dispatches.unshift(dispatch)
-    unit.status = 'Assigned'
+    unit.status = 'Deployed'
     incident.status = 'Assigned'
     addDemoLog(data, dispatch.assigned_by, `Created dispatch ${dispatch.dispatch_id}`)
     addDemoNotification(data, 'Dispatch assigned', `${unit.name || `Unit ${unit_id}`} assigned to ${incident.barangay || `incident ${incident_id}`}.`)
@@ -515,6 +621,7 @@ export const updateDispatchStatus = async (dispatchId, status) => {
   if (!dispatch) throw new Error('Dispatch record not found')
 
   dispatch.status = status
+  if (status === 'Completed') dispatch.route.status = 'Completed'
   const incident = data.incidents.find((item) => Number(item.incident_id) === Number(dispatch.incident_id))
   const unit = data.units.find((item) => Number(item.unit_id) === Number(dispatch.unit_id))
   if (incident) incident.status = status === 'Completed' ? 'Resolved' : status === 'En route' ? 'In Progress' : 'Assigned'

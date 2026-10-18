@@ -87,6 +87,12 @@ const optimalAssignment = (costMatrix) => {
   return munkres(costMatrix)
 }
 
+const routeAffectedByEdge = (route, edgeId) => {
+  const edgeIds = Array.isArray(route?.edge_ids) ? route.edge_ids.map(String) : []
+  const status = route?.status || route?.route_status
+  return status === 'Unreachable' || edgeIds.length === 0 || edgeIds.includes(String(edgeId))
+}
+
 const recommendAssignments = ({ units, incidents, nodes, edges }) => {
   const availableUnits = units.filter((unit) => String(unit.status).toLowerCase() === 'available')
   const pendingIncidents = incidents.filter((incident) => String(incident.status).toLowerCase() === 'pending')
@@ -134,5 +140,6 @@ module.exports = {
   createRoadGraph,
   shortestPath,
   optimalAssignment,
+  routeAffectedByEdge,
   recommendAssignments,
 }

@@ -4,7 +4,7 @@ const dotenv = require('dotenv')
 const fs = require('node:fs')
 const path = require('node:path')
 const { Pool } = require('pg')
-const { createRoadGraph, shortestPath, recommendAssignments } = require('./optimization')
+const { createRoadGraph, shortestPath, routeAffectedByEdge, recommendAssignments } = require('./optimization')
 
 dotenv.config()
 
@@ -74,8 +74,16 @@ const createLog = async (client, userId, action) => {
 const loadRoadNetwork = async (database) => {
   const [nodeResult, edgeResult] = await Promise.all([
     database.query('SELECT node_id, latitude, longitude FROM road_node'),
-    database.query('SELECT edge_id, from_node_id, to_node_id, is_passable FROM road_edge'),
+    database.query('SELECT edge_id, from_node_id, to_node_id, is_passable, distance_km FROM road_edge'),
   ])
+  const missingDistances = edgeResult.rows.filter((edge) => (
+    edge.distance_km == null || !Number.isFinite(Number(edge.distance_km)) || Number(edge.distance_km) < 0
+  ))
+  if (missingDistances.length) {
+    const error = new Error(`OSMnx distance_km is missing or invalid for ${missingDistances.length} road edge(s)`)
+    error.code = 'MISSING_EDGE_WEIGHTS'
+    throw error
+  }
 
   return {
     nodes: nodeResult.rows,
@@ -125,14 +133,14 @@ app.post('/api/incidents', requireDatabase, asyncRoute(async (req, res) => {
 
 app.get('/api/units', requireDatabase, tableList(
   'rescue_unit u LEFT JOIN road_node n ON n.node_id = u.current_node_id',
-  'u.unit_id, u.current_node_id, u.capacity, u.status, n.node_type, n.latitude, n.longitude',
+  'u.unit_id, u.unit_type, u.current_node_id, u.capacity, u.status, n.node_type, n.latitude, n.longitude',
   'u.unit_id',
 ))
 
 app.patch('/api/units/:id', requireDatabase, asyncRoute(async (req, res) => {
   const { status } = req.body
   if (!positiveId(req.params.id)) return res.status(400).json({ message: 'Unit id must be a positive integer' })
-  if (!['Available', 'Assigned'].includes(status)) return res.status(400).json({ message: 'Status must be Available or Assigned' })
+  if (!['Available', 'Deployed', 'Under maintenance'].includes(status)) return res.status(400).json({ message: 'Status must be Available, Deployed, or Under maintenance' })
 
   const client = await pool.connect()
   try {
@@ -164,7 +172,7 @@ app.get('/api/roads/nodes', requireDatabase, tableList(
 
 app.get('/api/roads/edges', requireDatabase, tableList(
   'road_edge',
-  'edge_id, from_node_id, to_node_id, is_passable',
+  'edge_id, from_node_id, to_node_id, is_passable, distance_km',
   'edge_id',
 ))
 
@@ -177,16 +185,52 @@ app.patch('/api/roads/edges/:id', requireDatabase, asyncRoute(async (req, res) =
   try {
     await client.query('BEGIN')
     const { rows } = await client.query(
-      'UPDATE road_edge SET is_passable = $1 WHERE edge_id = $2 RETURNING edge_id, from_node_id, to_node_id, is_passable',
+      'UPDATE road_edge SET is_passable = $1 WHERE edge_id = $2 RETURNING edge_id, from_node_id, to_node_id, is_passable, distance_km',
       [is_passable, Number(req.params.id)],
     )
     if (!rows.length) {
       await client.query('ROLLBACK')
       return res.status(404).json({ message: 'Road edge not found' })
     }
-    await createLog(client, Number(req.body.updated_by || process.env.DEFAULT_USER_ID || 1), `Updated road edge ${req.params.id} passability to ${is_passable}`)
+    const { rows: activeDispatches } = await client.query(`
+      SELECT d.dispatch_id, i.incident_id, i.location_node_id, i.status AS incident_status,
+        u.current_node_id, rt.edge_ids, rt.status AS route_status
+      FROM dispatch d
+      JOIN incident i ON i.incident_id = d.incident_id
+      JOIN rescue_unit u ON u.unit_id = d.unit_id
+      LEFT JOIN LATERAL (
+        SELECT edge_ids, status
+        FROM route
+        WHERE route.dispatch_id = d.dispatch_id
+        ORDER BY route_id DESC
+        LIMIT 1
+      ) rt ON TRUE
+      WHERE i.status IN ('Assigned', 'In Progress')
+    `)
+    const network = await loadRoadNetwork(client)
+    const reroutedDispatchIds = []
+    const unreachableDispatchIds = []
+
+    for (const dispatch of activeDispatches.rows) {
+      if (!routeAffectedByEdge({ edge_ids: dispatch.edge_ids, status: dispatch.route_status }, req.params.id)) continue
+
+      const path = shortestPath(network.graph, dispatch.current_node_id, dispatch.location_node_id)
+      const routeStatus = path ? 'Active' : 'Unreachable'
+      await client.query(
+        'INSERT INTO route (dispatch_id, total_distance, node_ids, edge_ids, status) VALUES ($1, $2, $3, $4, $5)',
+        [dispatch.dispatch_id, path?.distanceKm ?? 0, JSON.stringify(path?.nodeIds || []), JSON.stringify(path?.edgeIds || []), routeStatus],
+      )
+      if (path) reroutedDispatchIds.push(String(dispatch.dispatch_id))
+      else unreachableDispatchIds.push(String(dispatch.dispatch_id))
+    }
+
+    const updatedBy = Number(req.body.updated_by || process.env.DEFAULT_USER_ID || 1)
+    await createLog(client, updatedBy, `Updated road edge ${req.params.id} passability to ${is_passable}`)
+    if (reroutedDispatchIds.length || unreachableDispatchIds.length) {
+      await createLog(client, updatedBy, `Re-optimized ${reroutedDispatchIds.length} active route(s); ${unreachableDispatchIds.length} have no passable path`)
+    }
     await client.query('COMMIT')
-    res.json({ edge: rows[0] })
+    res.json({ edge: rows[0], reroutedDispatchIds, unreachableDispatchIds })
   } catch (error) {
     await client.query('ROLLBACK')
     throw error
@@ -199,11 +243,11 @@ app.get('/api/dispatches', requireDatabase, asyncRoute(async (_req, res) => {
   const { rows } = await pool.query(`
     SELECT d.dispatch_id, d.unit_id, d.incident_id, d.assigned_by,
       i.urgency_level, i.status AS incident_status,
-      rt.route_id, rt.total_distance
+      rt.route_id, rt.total_distance, rt.node_ids, rt.edge_ids, rt.status AS route_status
     FROM dispatch d
     LEFT JOIN incident i ON i.incident_id = d.incident_id
     LEFT JOIN LATERAL (
-      SELECT route_id, total_distance
+      SELECT route_id, total_distance, node_ids, edge_ids, status
       FROM route
       WHERE route.dispatch_id = d.dispatch_id
       ORDER BY route_id DESC
@@ -265,11 +309,11 @@ app.post('/api/dispatches', requireDatabase, asyncRoute(async (req, res) => {
       [Number(unit_id), Number(incident_id), Number(assigned_by)],
     )
     const { rows: routeRows } = await client.query(
-      'INSERT INTO route (dispatch_id, total_distance) VALUES ($1, $2) RETURNING route_id, dispatch_id, total_distance',
-      [dispatchRows[0].dispatch_id, path.distanceKm],
+      'INSERT INTO route (dispatch_id, total_distance, node_ids, edge_ids, status) VALUES ($1, $2, $3, $4, $5) RETURNING route_id, dispatch_id, total_distance, node_ids, edge_ids, status',
+      [dispatchRows[0].dispatch_id, path.distanceKm, JSON.stringify(path.nodeIds), JSON.stringify(path.edgeIds), 'Active'],
     )
 
-    await client.query('UPDATE rescue_unit SET status = $1 WHERE unit_id = $2', ['Assigned', Number(unit_id)])
+    await client.query('UPDATE rescue_unit SET status = $1 WHERE unit_id = $2', ['Deployed', Number(unit_id)])
     await client.query('UPDATE incident SET status = $1 WHERE incident_id = $2', ['Assigned', Number(incident_id)])
     await createLog(client, Number(assigned_by), `Created dispatch ${dispatchRows[0].dispatch_id}`)
     await client.query('COMMIT')
@@ -292,6 +336,7 @@ app.get('/api/logs', requireDatabase, asyncRoute(async (_req, res) => {
 
 app.use((error, _req, res, _next) => {
   console.error(error)
+  if (error.code === 'MISSING_EDGE_WEIGHTS') return res.status(503).json({ message: error.message })
   if (error.code === '23503') return res.status(400).json({ message: 'A referenced user, unit, incident, or node does not exist' })
   if (error.code === '23505') return res.status(409).json({ message: 'That record already exists' })
   if (error.code === '42P01' || error.code === '42703') {
