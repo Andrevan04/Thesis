@@ -265,6 +265,7 @@ button { color: inherit; }
   overflow: hidden;
   width: min(960px, 92vw);
   backdrop-filter: blur(10px);
+  min-width: 0;
 }
 
 .login-hero {
@@ -274,6 +275,7 @@ button { color: inherit; }
   flex-direction: column;
   justify-content: center;
   padding: clamp(32px, 4vw, 56px) clamp(26px, 3vw, 42px);
+  min-width: 0;
 }
 
 .login-mark {
@@ -318,6 +320,7 @@ button { color: inherit; }
   flex-direction: column;
   justify-content: center;
   padding: clamp(28px, 4vw, 52px) clamp(24px, 4vw, 42px);
+  min-width: 0;
 }
 
 .login-form {
@@ -328,11 +331,13 @@ button { color: inherit; }
 .login-input-row {
   display: grid;
   gap: 16px;
+  min-width: 0;
 }
 
 .login-field {
   display: grid;
   gap: 8px;
+  min-width: 0;
 }
 
 .login-field span {
@@ -349,9 +354,11 @@ button { color: inherit; }
   color: #203847;
   font-size: 0.96rem;
   height: 48px;
+  min-width: 0;
   outline: none;
   padding: 12px 14px;
   transition: border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
+  width: 100%;
 }
 
 .login-field select:focus,
@@ -406,7 +413,10 @@ button { color: inherit; }
 @media (max-width: 760px) {
   .login-panel {
     grid-template-columns: 1fr;
+    width: 100%;
   }
+
+  .login-input-row { grid-template-columns: minmax(0, 1fr); }
 
   .login-hero {
     border-right: 0;
