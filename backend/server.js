@@ -4,12 +4,8 @@ const dotenv = require('dotenv')
 const fs = require('node:fs')
 const path = require('node:path')
 const { Pool } = require('pg')
-<<<<<<< HEAD
 const { createRoadGraph, shortestPath, recommendAssignments } = require('./optimization')
 const axios = require("axios");
-=======
-const { createRoadGraph, shortestPath, routeAffectedByEdge, recommendAssignments } = require('./optimization')
->>>>>>> c267b8e818222d1b841f1dce2fcdf7bdece897c6
 
 dotenv.config()
 
