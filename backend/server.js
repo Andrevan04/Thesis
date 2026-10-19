@@ -81,7 +81,6 @@ const createLog = async (client, userId, action) => {
 
 const loadRoadNetwork = async (database) => {
   const [nodeResult, edgeResult] = await Promise.all([
-<<<<<<< HEAD
     database.query(
       'SELECT node_id, latitude, longitude FROM road_node'
     ),
@@ -96,19 +95,6 @@ const loadRoadNetwork = async (database) => {
       FROM road_edge
     `),
   ]);
-=======
-    database.query('SELECT node_id, latitude, longitude FROM road_node'),
-    database.query('SELECT edge_id, from_node_id, to_node_id, is_passable, distance_km FROM road_edge'),
-  ])
-  const missingDistances = edgeResult.rows.filter((edge) => (
-    edge.distance_km == null || !Number.isFinite(Number(edge.distance_km)) || Number(edge.distance_km) < 0
-  ))
-  if (missingDistances.length) {
-    const error = new Error(`OSMnx distance_km is missing or invalid for ${missingDistances.length} road edge(s)`)
-    error.code = 'MISSING_EDGE_WEIGHTS'
-    throw error
-  }
->>>>>>> c267b8e818222d1b841f1dce2fcdf7bdece897c6
 
   return {
     nodes: nodeResult.rows,
