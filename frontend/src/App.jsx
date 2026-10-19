@@ -99,6 +99,7 @@ function App() {
   const [error, setError] = useState('')
   const [modal, setModal] = useState(false)
   const [incidentSubmitting, setIncidentSubmitting] = useState(false)
+  const [dispatchSubmitting, setDispatchSubmitting] = useState(false)
 
   const refresh = async () => {
     setLoading(true)
@@ -278,6 +279,8 @@ function App() {
   }
 
   const createDispatches = async (recommendation) => {
+    if (dispatchSubmitting) return
+    setDispatchSubmitting(true)
     try {
       const created = await Promise.all(recommendation.assignments.map((assignment) => api.createDispatch({
         unit_id: assignment.unitId,
@@ -293,6 +296,8 @@ function App() {
       await recommendDispatches(false)
     } catch (requestError) {
       setNotice(requestError.message || 'Could not create dispatch')
+    } finally {
+      setDispatchSubmitting(false)
     }
   }
 
@@ -527,7 +532,11 @@ function App() {
       {recommendations.map((recommendation) => <article className="plan-card" key={recommendation.id}>
         <div className="plan-heading"><div><p className="eyebrow">Review before confirming dispatch</p><h3>Distance-minimized assignments</h3></div><span className="muted">{recommendation.unassignedIncidentIds.length} unassigned</span></div>
         <div className="table-scroll"><table className="data-table"><thead><tr><th>Incident</th><th>Unit</th><th>Urgency</th><th>Route distance</th><th>Route path</th></tr></thead><tbody>{recommendation.assignments.map((assignment) => <tr key={assignment.incidentId}><td>{assignment.incidentLabel} · {assignment.incidentId}</td><td>{assignment.unitName} · {assignment.unitId}</td><td>{assignment.priority}</td><td>{Number(assignment.distanceKm).toFixed(2)} km</td><td>{assignment.nodeIds?.join(' → ') || '—'}</td></tr>)}</tbody></table></div>
-        {activeRole === 'Coordinator' && <div className="plan-footer"><small>{assignmentAlgorithmLabel} minimizes total route distance across feasible passable paths. {routeAlgorithmLabel} computes each route.</small><button className="button-primary" onClick={() => createDispatches(recommendation)}><Check size={16} /> Confirm dispatches</button></div>}
+        {recommendation.unassignedIncidentIds.length > 0 && <p className="unassigned-notice"><strong>Manual follow-up needed:</strong> {recommendation.unassignedIncidentIds.map((incidentId) => {
+          const incident = incidents.find((item) => item.id === String(incidentId))
+          return `${incident?.barangay || 'Incident'} · ${incidentId}`
+        }).join(', ')}</p>}
+        {activeRole === 'Coordinator' && <div className="plan-footer"><small>{assignmentAlgorithmLabel} minimizes total route distance across feasible passable paths. {routeAlgorithmLabel} computes each route.</small><button className="button-primary" disabled={dispatchSubmitting} onClick={() => createDispatches(recommendation)}><Check size={16} /> {dispatchSubmitting ? 'Creating dispatches…' : 'Confirm dispatches'}</button></div>}
       </article>)}
       {(recommendations.length > 0 || activeRole === 'Coordinator') && <section className="panel route-preview-panel"><div className="panel-header"><div><h3>Recommended graph routes</h3><p className="panel-subtitle">Route overlay uses {routeAlgorithmLabel.toLowerCase()}.</p></div><span className="map-legend"><i className="legend-route" /> Recommended route</span></div><div className="map-frame"><NetworkMap roads={roads} roadGeometries={roadGeometries} incidents={incidents} nodes={nodes} highlightedEdgeIds={highlightedEdgeIds} /><div className="map-caption">Route overlay computed by {routeAlgorithmLabel.toLowerCase()}{roads.some((road) => !roadGeometries[road.id]) ? '; straight graph links shown where street geometry is unavailable' : ''}.</div></div></section>}
       <section className="panel">{dispatchTable(dispatches)}</section>

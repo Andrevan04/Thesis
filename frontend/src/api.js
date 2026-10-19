@@ -332,7 +332,7 @@ const normalizeRoad = (edge, nodes) => {
 }
 
 const normalizeDispatch = (dispatch, incidents = [], units = []) => {
-  const id = getId(dispatch)
+  const id = value(dispatch, 'dispatch_id', 'dispatchId', 'id')
   const incidentId = value(dispatch, 'incident_id', 'incidentId')
   const unitId = value(dispatch, 'unit_id', 'unitId')
   const route = dispatch.route || dispatch.routes?.[0] || dispatch
@@ -566,6 +566,9 @@ export const createDispatch = async ({ unit_id, incident_id, assigned_by, distan
     const unit = data.units.find((item) => String(item.unit_id) === String(unit_id))
     const incident = data.incidents.find((item) => String(item.incident_id) === String(incident_id))
     if (!unit || !incident) throw new Error('The selected unit or incident is no longer available')
+    if (unit.status !== 'Available' || incident.status !== 'Pending') {
+      throw new Error('The selected unit or incident is no longer available for dispatch')
+    }
     const dispatch = {
       dispatch_id: Math.max(0, ...data.dispatches.map((item) => Number(item.dispatch_id) || 0)) + 1,
       unit_id: Number(unit_id),
@@ -625,7 +628,10 @@ export const updateDispatchStatus = async (dispatchId, status) => {
   const incident = data.incidents.find((item) => Number(item.incident_id) === Number(dispatch.incident_id))
   const unit = data.units.find((item) => Number(item.unit_id) === Number(dispatch.unit_id))
   if (incident) incident.status = status === 'Completed' ? 'Resolved' : status === 'En route' ? 'In Progress' : 'Assigned'
-  if (unit && status === 'Completed') unit.status = 'Available'
+  if (unit && status === 'Completed') {
+    unit.status = 'Available'
+    if (incident) unit.current_node_id = incident.location_node_id
+  }
   addDemoLog(data, DEFAULT_USER_ID, `Updated dispatch ${dispatch.dispatch_id} to ${status}`)
   addDemoNotification(data, 'Dispatch status updated', `Dispatch ${dispatch.dispatch_id} is now ${status.toLowerCase()}.`)
   writeDemoData(data)
