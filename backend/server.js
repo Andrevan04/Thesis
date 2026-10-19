@@ -5,6 +5,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { Pool } = require('pg')
 const { createRoadGraph, shortestPath, recommendAssignments } = require('./optimization')
+const axios = require("axios");
 
 dotenv.config()
 
@@ -71,18 +72,35 @@ const createLog = async (client, userId, action) => {
   )
 }
 
+
+
+
 const loadRoadNetwork = async (database) => {
   const [nodeResult, edgeResult] = await Promise.all([
-    database.query('SELECT node_id, latitude, longitude FROM road_node'),
-    database.query('SELECT edge_id, from_node_id, to_node_id, is_passable FROM road_edge'),
-  ])
+    database.query(
+      'SELECT node_id, latitude, longitude FROM road_node'
+    ),
+    database.query(`
+      SELECT
+        edge_id,
+        from_node_id,
+        to_node_id,
+        is_passable,
+        distance_km,
+        travel_time_minutes
+      FROM road_edge
+    `),
+  ]);
 
   return {
     nodes: nodeResult.rows,
     edges: edgeResult.rows,
     graph: createRoadGraph(nodeResult.rows, edgeResult.rows),
-  }
-}
+  };
+};
+
+
+
 
 app.get('/api/health', asyncRoute(async (_req, res) => {
   if (!hasDatabaseConfig) {
@@ -99,29 +117,140 @@ app.get('/api/incidents', requireDatabase, tableList(
   'i.incident_id DESC',
 ))
 
+
 app.post('/api/incidents', requireDatabase, asyncRoute(async (req, res) => {
-  const { location_node_id, people_affected, urgency_level, reported_by, status = 'Pending' } = req.body
-  if (!positiveId(location_node_id) || !positiveId(people_affected) || !positiveId(reported_by) || !['Critical', 'High', 'Medium', 'Low'].includes(urgency_level)) {
-    return res.status(400).json({ message: 'location_node_id, people_affected, reported_by, and a valid urgency_level are required' })
+  const {
+    location_node_id,
+    people_affected,
+    urgency_level,
+    reported_by,
+    status = 'Pending',
+  } = req.body;
+
+  if (
+    !positiveId(location_node_id) ||
+    !positiveId(people_affected) ||
+    !positiveId(reported_by) ||
+    !['Critical', 'High', 'Medium', 'Low'].includes(urgency_level)
+  ) {
+    return res.status(400).json({
+      message: 'location_node_id, people_affected, reported_by, and a valid urgency_level are required',
+    });
   }
 
-  const client = await pool.connect()
+  const client = await pool.connect();
+  let incident;
+
+  // 1. Save the incident in PostgreSQL.
   try {
-    await client.query('BEGIN')
+    await client.query('BEGIN');
+
     const { rows } = await client.query(
-      'INSERT INTO incident (reported_by, location_node_id, people_affected, urgency_level, status) VALUES ($1, $2, $3, $4, $5) RETURNING incident_id, reported_by, location_node_id, people_affected, urgency_level, status',
-      [Number(reported_by), Number(location_node_id), Number(people_affected), urgency_level, status],
-    )
-    await createLog(client, Number(reported_by), `Created incident ${rows[0].incident_id}`)
-    await client.query('COMMIT')
-    res.status(201).json({ incident: rows[0] })
+      `INSERT INTO incident
+        (reported_by, location_node_id, people_affected, urgency_level, status)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING incident_id, reported_by, location_node_id,
+                 people_affected, urgency_level, status`,
+      [
+        Number(reported_by),
+        Number(location_node_id),
+        Number(people_affected),
+        urgency_level,
+        status,
+      ],
+    );
+
+    incident = rows[0];
+
+    await createLog(
+      client,
+      Number(reported_by),
+      `Created incident ${incident.incident_id}`,
+    );
+
+    await client.query('COMMIT');
   } catch (error) {
-    await client.query('ROLLBACK')
-    throw error
+    await client.query('ROLLBACK');
+    throw error;
   } finally {
-    client.release()
+    client.release();
   }
-}))
+
+  // 2. Automatically recalculate recommendations using Flask.
+  // The incident is already saved, even if optimization fails.
+  try {
+    const [unitResult, incidentResult, network] = await Promise.all([
+      pool.query(
+        `SELECT unit_id, current_node_id, capacity, status
+         FROM rescue_unit
+         WHERE status = 'Available'
+         ORDER BY unit_id`,
+      ),
+      pool.query(
+        `SELECT incident_id, location_node_id, people_affected,
+                urgency_level, status
+         FROM incident
+         WHERE status = 'Pending'
+         ORDER BY incident_id`,
+      ),
+      loadRoadNetwork(pool),
+    ]);
+
+    const optimizerData = {
+      edges: network.edges.map(edge => ({
+        from_node_id: Number(edge.from_node_id),
+        to_node_id: Number(edge.to_node_id),
+        distance_km: edge.distance_km == null
+          ? null
+          : Number(edge.distance_km),
+        travel_time_minutes: edge.travel_time_minutes == null
+          ? null
+          : Number(edge.travel_time_minutes),
+        is_passable: edge.is_passable,
+      })),
+
+      units: unitResult.rows.map(unit => ({
+        unit_id: Number(unit.unit_id),
+        current_node_id: Number(unit.current_node_id),
+        capacity: Number(unit.capacity),
+        status: unit.status,
+      })),
+
+      incidents: incidentResult.rows.map(item => ({
+        incident_id: Number(item.incident_id),
+        location_node_id: Number(item.location_node_id),
+        affected_residents: Number(item.people_affected),
+        urgency_level: item.urgency_level,
+        status: item.status,
+      })),
+    };
+
+    const optimizationResponse = await axios.post(
+      'http://127.0.0.1:5001/optimize',
+      optimizerData,
+      { timeout: 10000 },
+    );
+
+    // 3. Return the saved incident and the fresh recommendations.
+    return res.status(201).json({
+      incident,
+      recommendations: optimizationResponse.data,
+    });
+  } catch (error) {
+    console.error(
+      'Incident saved, but optimization failed:',
+      error.response?.data || error.message,
+    );
+
+    return res.status(201).json({
+      incident,
+      recommendations: null,
+      optimization_warning:
+        'Incident was saved, but recommendations could not be generated. Please refresh or retry recommendations.',
+    });
+  }
+}));
+
 
 app.get('/api/units', requireDatabase, tableList(
   'rescue_unit u LEFT JOIN road_node n ON n.node_id = u.current_node_id',
@@ -214,22 +343,62 @@ app.get('/api/dispatches', requireDatabase, asyncRoute(async (_req, res) => {
   res.json({ dispatches: rows })
 }))
 
+
+
+
 app.get('/api/dispatches/recommendations', requireDatabase, asyncRoute(async (_req, res) => {
   const [unitResult, incidentResult, network] = await Promise.all([
-    pool.query("SELECT unit_id, current_node_id, capacity, status FROM rescue_unit WHERE status = 'Available' ORDER BY unit_id"),
-    pool.query("SELECT incident_id, location_node_id, people_affected, urgency_level, status FROM incident WHERE status = 'Pending' ORDER BY incident_id"),
+    pool.query(
+      "SELECT unit_id, current_node_id, capacity, status FROM rescue_unit WHERE status = 'Available' ORDER BY unit_id"
+    ),
+    pool.query(
+      "SELECT incident_id, location_node_id, people_affected, urgency_level, status FROM incident WHERE status = 'Pending' ORDER BY incident_id"
+    ),
     loadRoadNetwork(pool),
-  ])
+  ]);
 
-  const result = recommendAssignments({
-    units: unitResult.rows,
-    incidents: incidentResult.rows,
-    nodes: network.nodes,
-    edges: network.edges,
-  })
+  // Convert database records to the format expected by Python.
+  const optimizerData = {
+    edges: network.edges.map(edge => ({
+      from_node_id: Number(edge.from_node_id),
+      to_node_id: Number(edge.to_node_id),
+      distance_km: edge.distance_km == null
+        ? null
+        : Number(edge.distance_km),
+      travel_time_minutes: edge.travel_time_minutes == null
+        ? null
+        : Number(edge.travel_time_minutes),
+      is_passable: edge.is_passable,
+    })),
 
-  res.json(result)
-}))
+    units: unitResult.rows.map(unit => ({
+      unit_id: Number(unit.unit_id),
+      current_node_id: Number(unit.current_node_id),
+      capacity: Number(unit.capacity),
+      status: unit.status,
+    })),
+
+    incidents: incidentResult.rows.map(incident => ({
+      incident_id: Number(incident.incident_id),
+      location_node_id: Number(incident.location_node_id),
+      affected_residents: Number(incident.people_affected),
+      urgency_level: incident.urgency_level,
+      status: incident.status,
+    })),
+  };
+
+  // Ask the Python optimizer to calculate the assignments.
+  const response = await axios.post(
+    'http://127.0.0.1:5001/optimize',
+    optimizerData,
+    { timeout: 10000 }
+  );
+
+  res.json(response.data);
+}));
+
+
+
 
 app.post('/api/dispatches', requireDatabase, asyncRoute(async (req, res) => {
   const { unit_id, incident_id, assigned_by } = req.body
@@ -290,6 +459,108 @@ app.get('/api/logs', requireDatabase, asyncRoute(async (_req, res) => {
   res.json({ logs: rows })
 }))
 
+app.get("/api/optimizer-test", async (req, res) => {
+    try {
+        const sampleData = {
+            edges: [
+                {
+                    from_node_id: 1,
+                    to_node_id: 2,
+                    distance_km: 2.0,
+                    travel_time_minutes: 4,
+                    is_passable: true
+                },
+                {
+                    from_node_id: 2,
+                    to_node_id: 3,
+                    distance_km: 1.5,
+                    travel_time_minutes: 3,
+                    is_passable: true
+                },
+                {
+                    from_node_id: 3,
+                    to_node_id: 2,
+                    distance_km: 1.5,
+                    travel_time_minutes: 3,
+                    is_passable: true
+                },
+                {
+                    from_node_id: 2,
+                    to_node_id: 1,
+                    distance_km: 2.0,
+                    travel_time_minutes: 4,
+                    is_passable: true
+                },
+                {
+                    from_node_id: 1,
+                    to_node_id: 3,
+                    distance_km: 5.0,
+                    
+                    is_passable: true
+                }
+            ],
+
+            units: [
+                {
+                    unit_id: 101,
+                    current_node_id: 1,
+                    capacity: 10,
+                    status: "Available"
+                },
+                {
+                    unit_id: 102,
+                    current_node_id: 3,
+                    capacity: 5,
+                    status: "Available"
+                }
+            ],
+
+            incidents: [
+                {
+                    incident_id: 201,
+                    location_node_id: 3,
+                    affected_residents: 8,
+                    status: "Pending"
+                },
+                {
+                    incident_id: 202,
+                    location_node_id: 2,
+                    affected_residents: 4,
+                    status: "Pending"
+                },
+                {
+                    incident_id: 203,
+                    location_node_id: 1,
+                    affected_residents: 20,
+                    status: "Pending"
+                }
+            ]
+        };
+
+        const response = await axios.post(
+            "http://127.0.0.1:5001/optimize",
+            sampleData,
+            { timeout: 10000 }
+        );
+
+        res.json({
+            message: "Node.js successfully called the Python optimizer.",
+            optimization: response.data
+        });
+    } catch (error) {
+        console.error(
+            "Optimizer request failed:",
+            error.response?.data || error.message
+        );
+
+        res.status(502).json({
+            error: "Could not get a result from the Python optimizer."
+        });
+    }
+});
+
+
+
 app.use((error, _req, res, _next) => {
   console.error(error)
   if (error.code === '23503') return res.status(400).json({ message: 'A referenced user, unit, incident, or node does not exist' })
@@ -301,6 +572,11 @@ app.use((error, _req, res, _next) => {
 })
 
 app.use((_req, res) => res.status(404).json({ message: 'API route not found' }))
+
+
+
+
+
 
 const startServer = async () => {
   if (hasDatabaseConfig) {
