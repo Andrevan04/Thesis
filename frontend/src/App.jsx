@@ -277,12 +277,36 @@ function App() {
   const presentationRoute = isDemoMode
     ? activeAssignedDispatches.find(({ assignment }) => assignment.incidentId === '2')
     : null
-  const overviewRoute = activeAssignedDispatches.find(({ dispatch }) => dispatch.id === selectedOverviewDispatchId)
-    || presentationRoute
-    || activeAssignedDispatches[0]
-  const selectedDispatchMapRoute = activeAssignedDispatches.find(({ dispatch }) => dispatch.id === selectedDispatchMapId)
-    || presentationRoute
-    || activeAssignedDispatches[0]
+  const activeRouteMapTargets = activeAssignedDispatches.map((target) => ({
+    ...target,
+    key: `dispatch:${target.dispatch.id}`,
+    pending: false,
+  }))
+  const pendingIncidentMapTargets = activeRole === 'Coordinator'
+    ? incidents.filter((incident) => incident.status.toLowerCase() === 'pending').map((incident) => ({
+        key: `incident:${incident.id}`,
+        incident,
+        unit: null,
+        dispatch: null,
+        pending: true,
+        assignment: {
+          incidentId: incident.id,
+          incidentLabel: incident.barangay,
+          unitId: '',
+          unitName: 'No unit assigned',
+        },
+      }))
+    : []
+  const routeMapTargets = [...activeRouteMapTargets, ...pendingIncidentMapTargets]
+  const presentationRouteTarget = activeRouteMapTargets.find((target) => (
+    target.dispatch.id === presentationRoute?.dispatch.id
+  ))
+  const getSelectedMapTarget = (selectedKey) => routeMapTargets.find((target) => target.key === selectedKey)
+    || presentationRouteTarget
+    || activeRouteMapTargets[0]
+    || pendingIncidentMapTargets[0]
+  const overviewRoute = getSelectedMapTarget(selectedOverviewDispatchId)
+  const selectedDispatchMapRoute = getSelectedMapTarget(selectedDispatchMapId)
   const allNavItems = [
     { id: 'overview', label: 'Overview', icon: LayoutDashboard },
     { id: 'incidents', label: 'Incidents', icon: ShieldAlert },
@@ -708,13 +732,17 @@ function App() {
       </article>)}
       {activeRole === 'Coordinator' && <section className="panel route-preview-panel">
         <div className="panel-header">
-          <div><p className="eyebrow">Currently viewing</p><h3>{selectedDispatchMapRoute ? `Incident ${selectedDispatchMapRoute.assignment.incidentId} · ${selectedDispatchMapRoute.incident?.barangay || selectedDispatchMapRoute.assignment.incidentLabel}` : 'No active assigned route'}</h3><p className="panel-subtitle">Map displays only one active assigned route at a time.</p></div>
-          {activeAssignedDispatches.length > 0 && <label className="select-field map-incident-picker"><MapPin size={15} /><select aria-label="Select assigned incident route to show" value={selectedDispatchMapRoute?.dispatch.id || ''} onChange={(event) => setSelectedDispatchMapId(event.target.value)}>{activeAssignedDispatches.map(({ dispatch, assignment, incident }) => <option key={`${dispatch.id}-${assignment.incidentId}`} value={dispatch.id}>Incident {assignment.incidentId} · {incident?.barangay || assignment.incidentLabel}</option>)}</select></label>}
+          <div><p className="eyebrow">Currently viewing</p><h3>{selectedDispatchMapRoute ? `Incident ${selectedDispatchMapRoute.assignment.incidentId} · ${selectedDispatchMapRoute.incident?.barangay || selectedDispatchMapRoute.assignment.incidentLabel}` : 'No active incidents to view'}</h3><p className="panel-subtitle">Select an assigned route or pending incident to view its location and current route availability.</p></div>
+          {routeMapTargets.length > 0 && <label className="select-field map-incident-picker"><MapPin size={15} /><select aria-label="Select incident to show on dispatch map" value={selectedDispatchMapRoute?.key || ''} onChange={(event) => setSelectedDispatchMapId(event.target.value)}>{routeMapTargets.map((target) => <option key={target.key} value={target.key}>Incident {target.assignment.incidentId} · {target.incident?.barangay || target.assignment.incidentLabel}{target.pending ? ' · Pending' : ''}</option>)}</select></label>}
         </div>
         {selectedDispatchMapRoute ? <>
-          <p className="assigned-route-context">Point A: {selectedDispatchMapRoute.unit?.name || selectedDispatchMapRoute.assignment.unitName} → Point B: Incident {selectedDispatchMapRoute.assignment.incidentId} · {selectedDispatchMapRoute.incident?.barangay || selectedDispatchMapRoute.assignment.incidentLabel} · {selectedDispatchMapRoute.dispatch.status}</p>
-          <div className="map-legend"><i className="legend-incident" /> Selected incident <i className="legend-unit" /> Assigned unit <i className="legend-recommended" /> Recommended route <i className="legend-passable" /> Passable <i className="legend-impassable" /> Impassable</div>
-          <div className="map-frame"><NetworkMap roads={roads} incidents={selectedDispatchMapRoute.incident ? [selectedDispatchMapRoute.incident] : []} originUnit={selectedDispatchMapRoute.unit} demoMode={isDemoMode} /><div className="map-caption">{isDemoMode ? 'Routes follow mapped streets from the assigned unit to the selected incident; demo passability and blocked conditions are simulated.' : 'Routes connect the assigned unit to the selected incident along connected road edges; red dashed marks an impassable route.'}</div></div>
+          <p className="assigned-route-context">{selectedDispatchMapRoute.pending
+            ? `Pending incident · Incident ${selectedDispatchMapRoute.assignment.incidentId} · ${selectedDispatchMapRoute.incident?.barangay || selectedDispatchMapRoute.assignment.incidentLabel} · no unit assigned yet`
+            : `Point A: ${selectedDispatchMapRoute.unit?.name || selectedDispatchMapRoute.assignment.unitName} → Point B: Incident ${selectedDispatchMapRoute.assignment.incidentId} · ${selectedDispatchMapRoute.incident?.barangay || selectedDispatchMapRoute.assignment.incidentLabel} · ${selectedDispatchMapRoute.dispatch.status}`}</p>
+          <div className="map-legend"><i className="legend-incident" /> Selected incident {selectedDispatchMapRoute.unit && <><i className="legend-unit" /> Assigned unit <i className="legend-recommended" /> Recommended route <i className="legend-passable" /> Passable <i className="legend-impassable" /> Impassable</>}</div>
+          <div className="map-frame"><NetworkMap roads={roads} incidents={selectedDispatchMapRoute.incident ? [selectedDispatchMapRoute.incident] : []} originUnit={selectedDispatchMapRoute.unit} demoMode={isDemoMode} /><div className="map-caption">{selectedDispatchMapRoute.pending
+            ? 'Pending incident location is shown without an assigned unit. Re-optimize assignments after unit availability or road conditions change.'
+            : isDemoMode ? 'Routes follow mapped streets from the assigned unit to the selected incident; demo passability and blocked conditions are simulated.' : 'Routes connect the assigned unit to the selected incident along connected road edges; red dashed marks an impassable route.'}</div></div>
         </> : <p className="empty-state">No incidents are currently assigned to a unit.</p>}
       </section>}
       <section className="panel">{dispatchTable(dispatches)}</section>
@@ -737,11 +765,15 @@ function App() {
         <Metric icon={Clock3} label="Latest activity" value={logs[0]?.time || '—'} trend="System log" tone="green" />
       </section>
       <section className="overview-grid">
-        <div className="panel map-panel"><div className="panel-header"><div><p className="eyebrow">Currently viewing</p><h3>{overviewRoute ? `Incident ${overviewRoute.assignment.incidentId} · ${overviewRoute.incident?.barangay || overviewRoute.assignment.incidentLabel}` : 'No active assigned route'}</h3><p className="panel-subtitle">Overview map is focused on an active assigned incident route.</p></div>{activeAssignedDispatches.length > 0 && <label className="select-field map-incident-picker"><MapPin size={15} /><select aria-label="Select overview assigned incident" value={overviewRoute?.dispatch.id || ''} onChange={(event) => setSelectedOverviewDispatchId(event.target.value)}>{activeAssignedDispatches.map(({ dispatch, assignment, incident }) => <option key={`${dispatch.id}-${assignment.incidentId}`} value={dispatch.id}>Incident {assignment.incidentId} · {incident?.barangay || assignment.incidentLabel}</option>)}</select></label>}</div>
+        <div className="panel map-panel"><div className="panel-header"><div><p className="eyebrow">Currently viewing</p><h3>{overviewRoute ? `Incident ${overviewRoute.assignment.incidentId} · ${overviewRoute.incident?.barangay || overviewRoute.assignment.incidentLabel}` : 'No active incidents to view'}</h3><p className="panel-subtitle">View an assigned route or inspect a pending incident location.</p></div>{routeMapTargets.length > 0 && <label className="select-field map-incident-picker"><MapPin size={15} /><select aria-label="Select overview incident" value={overviewRoute?.key || ''} onChange={(event) => setSelectedOverviewDispatchId(event.target.value)}>{routeMapTargets.map((target) => <option key={target.key} value={target.key}>Incident {target.assignment.incidentId} · {target.incident?.barangay || target.assignment.incidentLabel}{target.pending ? ' · Pending' : ''}</option>)}</select></label>}</div>
           {overviewRoute ? <>
-            <p className="assigned-route-context">Point A: {overviewRoute.unit?.name || overviewRoute.assignment.unitName} → Point B: Incident {overviewRoute.assignment.incidentId} · {overviewRoute.incident?.barangay || overviewRoute.assignment.incidentLabel} · {overviewRoute.dispatch.status}</p>
-            <div className="map-legend"><i className="legend-incident" /> Selected incident <i className="legend-unit" /> Assigned unit <i className="legend-recommended" /> Recommended route <i className="legend-passable" /> Passable <i className="legend-impassable" /> Impassable</div>
-            <div className="map-frame"><NetworkMap roads={roads} incidents={overviewRoute.incident ? [overviewRoute.incident] : []} originUnit={overviewRoute.unit} active={activePage === 'overview'} demoMode={isDemoMode} /><div className="map-caption">{isDemoMode ? 'Routes follow mapped streets from the assigned unit to the selected incident; demo passability and blocked conditions are simulated.' : 'Routes connect the assigned unit to the selected incident along connected road edges; red dashed marks an impassable route.'}</div></div>
+            <p className="assigned-route-context">{overviewRoute.pending
+              ? `Pending incident · Incident ${overviewRoute.assignment.incidentId} · ${overviewRoute.incident?.barangay || overviewRoute.assignment.incidentLabel} · no unit assigned yet`
+              : `Point A: ${overviewRoute.unit?.name || overviewRoute.assignment.unitName} → Point B: Incident ${overviewRoute.assignment.incidentId} · ${overviewRoute.incident?.barangay || overviewRoute.assignment.incidentLabel} · ${overviewRoute.dispatch.status}`}</p>
+            <div className="map-legend"><i className="legend-incident" /> Selected incident {overviewRoute.unit && <><i className="legend-unit" /> Assigned unit <i className="legend-recommended" /> Recommended route <i className="legend-passable" /> Passable <i className="legend-impassable" /> Impassable</>}</div>
+            <div className="map-frame"><NetworkMap roads={roads} incidents={overviewRoute.incident ? [overviewRoute.incident] : []} originUnit={overviewRoute.unit} active={activePage === 'overview'} demoMode={isDemoMode} /><div className="map-caption">{overviewRoute.pending
+              ? 'Pending incident location is shown without an assigned unit. Re-optimize assignments after unit availability or road conditions change.'
+              : isDemoMode ? 'Routes follow mapped streets from the assigned unit to the selected incident; demo passability and blocked conditions are simulated.' : 'Routes connect the assigned unit to the selected incident along connected road edges; red dashed marks an impassable route.'}</div></div>
           </> : <p className="empty-state">No incidents are currently assigned to a unit. Pending and resolved incidents are excluded.</p>}
         </div>
         <div className="panel incident-panel"><div className="panel-header"><div><h3>Priority queue</h3><p className="panel-subtitle">Unresolved incidents by urgency</p></div><button className="text-button" onClick={() => setActivePage('incidents')}>View all <ArrowUpRight size={14} /></button></div>
@@ -963,7 +995,8 @@ function NetworkMap({ roads, incidents, originUnit, active = true, demoMode = fa
       setStreetRouteOptions(directStreetRoutes)
       const routeError = results.find(([, , error]) => error)?.[2]
       const hasRoute = Object.values(routeOptions).some(Boolean) || Boolean(directStreetRoutes)
-      setRouteGeometryError(routeError || directStreetRouteError || (!hasRoute
+      const hasRouteEndpoints = Array.isArray(originLocation) && Array.isArray(incidentLocation)
+      setRouteGeometryError(routeError || directStreetRouteError || (!hasRoute && hasRouteEndpoints
         ? 'No routes available: the selected unit and incident have no connected path with valid road distance and passability data.'
         : ''))
     }
