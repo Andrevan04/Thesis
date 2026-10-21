@@ -132,13 +132,24 @@ button { color: inherit; }
 .map-legend i { display: inline-block; flex: 0 0 auto; }
 .legend-incident { background: #d95349; margin-left: 4px; }
 .map-legend .legend-incident { border: 2px solid #fff; border-radius: 50%; box-shadow: 0 0 0 1px #d95349; height: 8px; width: 8px; }
-.legend-road-passable { border-top: 3px solid #137c8b; height: 0; margin-left: 4px; width: 17px; }
-.legend-blocked { border-top: 3px dashed #d3534b; height: 0; margin-left: 4px; width: 17px; }
-.legend-route { border-top: 5px solid #db8b32; height: 0; margin-left: 4px; width: 17px; }
+.legend-unit { background: #2875a0; border: 1px solid #fff; border-radius: 50%; box-shadow: 0 0 0 1px #2875a0; height: 8px; margin-left: 4px; width: 8px; }
+.legend-recommended, .legend-passable, .legend-impassable { border-top: 4px solid; height: 0; margin-left: 4px; width: 17px; }
+.legend-recommended { border-color: #db8b32; }
+.legend-passable { border-color: #2875a0; }
+.legend-impassable { border-color: #c84d47; border-top-style: dashed; }
+.map-incident-picker { flex: 0 1 auto; min-width: 0; }
+.map-incident-picker select { max-width: 190px; }
 .map-frame { position: relative; }
+.map-route-error { background: #fff4ef; border-radius: 4px; color: #a04d40; font-size: 9px; margin: 0 0 7px; padding: 6px 8px; }
 .map-frame .leaflet-container { background: #dde9e5; border-radius: 6px; font: inherit; height: 294px; isolation: isolate; width: 100%; z-index: 0; }
 .map-frame .leaflet-control-attribution { font-size: 8px; }
 .map-caption { background: rgba(255,255,255,.92); border-radius: 4px; bottom: 9px; color: #667c82; font-size: 8px; left: 9px; padding: 4px 6px; pointer-events: none; position: absolute; z-index: 400; }
+.route-selection-panel { margin-bottom: 14px; }
+.assigned-route-context { color: #71828d; font-size: 9px; line-height: 1.5; margin: 0 0 10px; }
+.selected-route-row { background: #f1f7f4; }
+.route-select-button { background: transparent; border: 0; cursor: pointer; padding: 0; text-align: left; }
+.route-select-button:hover strong, .route-select-button[aria-pressed="true"] strong { color: #216c64; }
+.route-select-button:focus-visible { border-radius: 3px; outline: 2px solid #6d9f94; outline-offset: 3px; }
 .incident-panel { min-height: 355px; }
 .text-button { align-items: center; background: transparent; border: 0; color: #2b6870; cursor: pointer; display: inline-flex; font-size: 9px; font-weight: 700; gap: 3px; padding: 5px 0; white-space: nowrap; }
 .text-button:hover { color: #174f58; }

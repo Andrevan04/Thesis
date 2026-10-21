@@ -69,17 +69,122 @@ function StatusPill({ children, tone = '' }) {
   return <span className={`status-pill ${tone}`}>{children}</span>
 }
 
+const findRoadPath = (roads, startNodeId, endNodeId, { excludedEdgeIds = new Set() } = {}) => {
+  const start = String(startNodeId ?? '')
+  const end = String(endNodeId ?? '')
+  if (!start || !end) return null
+  if (start === end) return { distanceKm: 0, nodeIds: [start], edgeIds: [] }
+
+  const adjacency = new Map()
+  for (const road of roads) {
+    const fromId = String(road.from_node_id ?? road.fromNodeId ?? road.from?.node_id ?? road.from?.nodeId ?? road.from?.id ?? '')
+    const toId = String(road.to_node_id ?? road.toNodeId ?? road.to?.node_id ?? road.to?.nodeId ?? road.to?.id ?? '')
+    const edgeId = String(road.id ?? road.edge_id ?? road.edgeId ?? '')
+    const distanceKm = Number(road.distanceKm)
+    if (!fromId || !toId || !edgeId || road.distanceKm == null || excludedEdgeIds.has(edgeId) || road.condition !== 'Passable' || !Number.isFinite(distanceKm) || distanceKm < 0) continue
+    if (!adjacency.has(fromId)) adjacency.set(fromId, [])
+    adjacency.get(fromId).push({ edgeId, fromId, toId, distanceKm })
+  }
+
+  const distances = new Map([[start, 0]])
+  const previous = new Map()
+  const visited = new Set()
+
+  while (true) {
+    let currentNodeId = null
+    let bestDistance = Infinity
+    for (const [nodeId, distance] of distances) {
+      if (!visited.has(nodeId) && distance < bestDistance) {
+        currentNodeId = nodeId
+        bestDistance = distance
+      }
+    }
+    if (currentNodeId === null) break
+    if (currentNodeId === end) break
+
+    visited.add(currentNodeId)
+    for (const edge of adjacency.get(currentNodeId) || []) {
+      const nextDistance = bestDistance + edge.distanceKm
+      if (nextDistance < (distances.get(edge.toId) ?? Infinity)) {
+        distances.set(edge.toId, nextDistance)
+        previous.set(edge.toId, { nodeId: currentNodeId, edgeId: edge.edgeId })
+      }
+    }
+  }
+
+  if (!distances.has(end)) return null
+  const nodeIds = [end]
+  const edgeIds = []
+  let currentNodeId = end
+  while (currentNodeId !== start) {
+    const step = previous.get(currentNodeId)
+    if (!step) return null
+    edgeIds.unshift(step.edgeId)
+    nodeIds.unshift(step.nodeId)
+    currentNodeId = step.nodeId
+  }
+  return { distanceKm: distances.get(end), nodeIds, edgeIds }
+}
+
+const getMapRouteOptions = (roads, startNodeId, endNodeId, assignedEdgeIds, assignedNodeIds) => {
+  const recommended = findRoadPath(roads, startNodeId, endNodeId)
+  const route = recommended || (assignedEdgeIds.length && assignedEdgeIds.every((id) => roads.find((road) => String(road.id) === String(id))?.condition === 'Passable')
+    ? { edgeIds: assignedEdgeIds.map(String), nodeIds: assignedNodeIds, distanceKm: null }
+    : null)
+  const passable = []
+  const seenPaths = new Set(route ? [route.edgeIds.join(',')] : [])
+
+  if (recommended) {
+    for (const edgeId of recommended.edgeIds) {
+      const alternative = findRoadPath(roads, startNodeId, endNodeId, { excludedEdgeIds: new Set([edgeId]) })
+      if (!alternative || alternative.distanceKm <= recommended.distanceKm + 1e-6) continue
+      const pathKey = alternative.edgeIds.join(',')
+      if (seenPaths.has(pathKey)) continue
+      seenPaths.add(pathKey)
+      passable.push(alternative)
+    }
+  }
+
+  passable.sort((first, second) => first.distanceKm - second.distanceKm)
+  const blockedConnections = roads.flatMap((blockedRoad) => {
+    if (blockedRoad.condition !== 'Impassable') return []
+    const fromNodeId = blockedRoad.from_node_id ?? blockedRoad.fromNodeId ?? blockedRoad.from?.node_id ?? blockedRoad.from?.nodeId ?? blockedRoad.from?.id
+    const toNodeId = blockedRoad.to_node_id ?? blockedRoad.toNodeId ?? blockedRoad.to?.node_id ?? blockedRoad.to?.nodeId ?? blockedRoad.to?.id
+    const blockedEdgeId = String(blockedRoad.id ?? blockedRoad.edge_id ?? blockedRoad.edgeId ?? '')
+    const blockedDistance = Number(blockedRoad.distanceKm)
+    if (!fromNodeId || !toNodeId || !blockedEdgeId || !Number.isFinite(blockedDistance) || blockedDistance < 0) return []
+
+    const approach = findRoadPath(roads, startNodeId, fromNodeId)
+    const departure = findRoadPath(roads, toNodeId, endNodeId)
+    if (!approach || !departure || approach.nodeIds.some((nodeId) => departure.nodeIds.includes(nodeId))) return []
+
+    return [{
+      distanceKm: approach.distanceKm + blockedDistance + departure.distanceKm,
+      nodeIds: [...approach.nodeIds, String(toNodeId), ...departure.nodeIds.slice(1)],
+      edgeIds: [...approach.edgeIds, blockedEdgeId, ...departure.edgeIds],
+      blockedEdgeIds: [blockedEdgeId],
+    }]
+  }).sort((first, second) => first.distanceKm - second.distanceKm)
+  return {
+    recommended: route,
+    passable: passable[0] || null,
+    impassable: blockedConnections[0] || null,
+  }
+}
+
 function App() {
   const [incidents, setIncidents] = useState([])
   const [units, setUnits] = useState([])
   const [roads, setRoads] = useState([])
-  const [roadGeometries, setRoadGeometries] = useState({})
   const [nodes, setNodes] = useState([])
   const [logs, setLogs] = useState([])
   const [notifications, setNotifications] = useState([])
   const [dispatches, setDispatches] = useState([])
   const [recommendations, setRecommendations] = useState([])
   const [activePage, setActivePage] = useState('overview')
+  const [selectedOverviewDispatchId, setSelectedOverviewDispatchId] = useState('')
+  const [selectedDispatchMapId, setSelectedDispatchMapId] = useState('')
+  const [selectedAssignedDispatchId, setSelectedAssignedDispatchId] = useState('')
   const [demoUsers, setDemoUsers] = useState(() => loadLocalJson('flood-dispatch-demo-users', initialDemoUsers).map((user) => ({
     ...user,
     role: user.role === 'Field Responder' ? fieldResponderRole : user.role,
@@ -128,25 +233,6 @@ function App() {
   }, [])
 
   useEffect(() => {
-    let cancelled = false
-
-    const loadRoadGeometries = async () => {
-      const entries = await Promise.all(roads.map(async (road) => {
-        try {
-          return [road.id, await api.getRoadGeometry(road)]
-        } catch {
-          return [road.id, null]
-        }
-      }))
-
-      if (!cancelled) setRoadGeometries(Object.fromEntries(entries.filter(([, positions]) => positions)))
-    }
-
-    loadRoadGeometries()
-    return () => { cancelled = true }
-  }, [roads])
-
-  useEffect(() => {
     if (!notice) return undefined
     const timeout = window.setTimeout(() => setNotice(''), 3500)
     return () => window.clearTimeout(timeout)
@@ -174,10 +260,18 @@ function App() {
   const activeUser = demoUsers.find((user) => user.id === String(activeUserId)) || demoUsers[0]
   const activeDemoUsers = demoUsers.filter((user) => user.active !== false)
   const activeRole = activeUser?.role || 'Coordinator'
-  const highlightedEdgeIds = [
-    ...recommendations.flatMap((recommendation) => recommendation.assignments.flatMap((assignment) => assignment.edgeIds || [])),
-    ...dispatches.flatMap((dispatch) => dispatch.assignments.flatMap((assignment) => assignment.edgeIds || [])),
-  ]
+  const activeAssignedDispatches = dispatches.flatMap((dispatch) => (dispatch.assignments || []).map((assignment) => {
+    const incident = incidents.find((item) => item.id === assignment.incidentId)
+    const unit = units.find((item) => item.id === assignment.unitId)
+    return { dispatch, assignment, incident, unit }
+  })).filter(({ dispatch, incident }) => (
+    String(dispatch.status).toLowerCase() !== 'completed'
+    && ['assigned', 'in progress'].includes(String(incident?.status).toLowerCase())
+  ))
+  const overviewRoute = activeAssignedDispatches.find(({ dispatch }) => dispatch.id === selectedOverviewDispatchId)
+    || activeAssignedDispatches[0]
+  const selectedDispatchMapRoute = activeAssignedDispatches.find(({ dispatch }) => dispatch.id === selectedDispatchMapId)
+    || activeAssignedDispatches[0]
   const allNavItems = [
     { id: 'overview', label: 'Overview', icon: LayoutDashboard },
     { id: 'incidents', label: 'Incidents', icon: ShieldAlert },
@@ -517,12 +611,25 @@ function App() {
     </>
 
     if (activePage === 'dispatches' && activeRole === fieldResponderRole) {
-      const assignedRoutes = dispatches.filter((dispatch) => dispatch.assignments?.some((assignment) => assignment.unitId === String(activeUser.unitId)))
+      const assignedRoutes = activeAssignedDispatches
+        .filter(({ assignment }) => assignment.unitId === String(activeUser.unitId))
+        .map(({ dispatch }) => dispatch)
+      const selectedDispatch = assignedRoutes.find((dispatch) => dispatch.id === selectedAssignedDispatchId) || assignedRoutes[0]
+      const selectedAssignment = selectedDispatch?.assignments.find((assignment) => assignment.unitId === String(activeUser.unitId))
+      const selectedIncident = incidents.find((incident) => incident.id === selectedAssignment?.incidentId)
+      const selectedRouteUnit = units.find((unit) => unit.id === selectedAssignment?.unitId)
       return <>
         <PageHeading title="My assigned routes" subtitle="Update dispatch progress and share road observations with the coordinator." action={<label className="select-field responder-unit-picker"><Truck size={15} /><select aria-label="Select assigned rescue unit" value={activeUser.unitId || ''} onChange={(event) => setDemoUsers((current) => current.map((user) => user.id === activeUser.id ? { ...user, unitId: event.target.value } : user))}>{units.map((unit) => <option key={unit.id} value={unit.id}>{unit.name}</option>)}</select></label>} />
+        {selectedDispatch && selectedAssignment && <section className="panel route-selection-panel">
+          <div className="panel-header"><div><p className="eyebrow">Currently viewing</p><h3>Incident {selectedAssignment.incidentId} · {selectedIncident?.barangay || selectedAssignment.incidentLabel}</h3><p className="panel-subtitle">Point A: {selectedAssignment.unitName} · Node {selectedRouteUnit?.current_node_id ?? selectedRouteUnit?.currentNodeId ?? '—'} → Point B: Incident {selectedAssignment.incidentId} · Node {selectedIncident?.locationNodeId ?? '—'}</p></div><StatusPill tone={selectedDispatch.routeStatus === 'Unreachable' ? 'blocked' : 'available'}>{selectedDispatch.routeStatus === 'Unreachable' ? 'Route blocked' : selectedDispatch.status}</StatusPill></div>
+          <div className="map-legend"><i className="legend-recommended" /> Recommended <i className="legend-passable" /> Passable <i className="legend-impassable" /> Blocked route</div>
+          <div className="map-frame"><NetworkMap roads={roads} nodes={nodes} incidents={selectedIncident ? [selectedIncident] : []} originUnit={selectedRouteUnit} routeEdgeIds={selectedAssignment.edgeIds || []} routeNodeIds={selectedAssignment.nodeIds || []} /><div className="map-caption">Red dashed connects Point A to the incident through an impassable road; it is not traversable.</div></div>
+        </section>}
         <section className="panel"><div className="table-scroll"><table className="data-table"><thead><tr><th>Incident</th><th>Route</th><th>Distance</th><th>Dispatch status</th><th>Update</th></tr></thead><tbody>{assignedRoutes.map((dispatch) => {
           const assignment = dispatch.assignments[0]
-          return <tr key={dispatch.id}><td><strong>{assignment.incidentLabel}</strong><small>Incident {assignment.incidentId}</small></td><td>{dispatch.routeStatus === 'Unreachable' ? 'No passable route' : assignment.nodeIds?.join(' → ') || 'Route details unavailable'}</td><td>{dispatch.routeStatus === 'Unreachable' ? '—' : assignment.distanceKm != null ? `${Number(assignment.distanceKm).toFixed(2)} km` : assignment.eta}</td><td><StatusPill tone={dispatch.routeStatus === 'Unreachable' ? 'blocked' : dispatch.status.toLowerCase().replace(' ', '-')}>{dispatch.routeStatus === 'Unreachable' ? 'Route blocked' : dispatch.status}</StatusPill></td><td><select className="inline-select" aria-label={`Update dispatch ${dispatch.dispatchId} status`} value={dispatch.status} onChange={(event) => updateDispatch(dispatch.dispatchId, event.target.value)}><option>Assigned</option><option>En route</option><option>Completed</option></select></td></tr>
+          return <tr key={dispatch.id} className={selectedDispatch?.id === dispatch.id ? 'selected-route-row' : ''}>
+            <td><button className="route-select-button" type="button" aria-pressed={selectedDispatch?.id === dispatch.id} onClick={() => setSelectedAssignedDispatchId(dispatch.id)}><strong>{assignment.incidentLabel}</strong><small>Incident {assignment.incidentId}</small></button></td>
+            <td>{dispatch.routeStatus === 'Unreachable' ? 'No passable route' : assignment.nodeIds?.join(' → ') || 'Route details unavailable'}</td><td>{dispatch.routeStatus === 'Unreachable' ? '—' : assignment.distanceKm != null ? `${Number(assignment.distanceKm).toFixed(2)} km` : assignment.eta}</td><td><StatusPill tone={dispatch.routeStatus === 'Unreachable' ? 'blocked' : dispatch.status.toLowerCase().replace(' ', '-')}>{dispatch.routeStatus === 'Unreachable' ? 'Route blocked' : dispatch.status}</StatusPill></td><td><select className="inline-select" aria-label={`Update dispatch ${dispatch.dispatchId} status`} value={dispatch.status} onChange={(event) => updateDispatch(dispatch.dispatchId, event.target.value)}><option>Assigned</option><option>En route</option><option>Completed</option></select></td></tr>
         })}</tbody></table>{!assignedRoutes.length && <p className="empty-state">No routes are assigned to this demo user.</p>}</div></section>
       </>
     }
@@ -538,7 +645,17 @@ function App() {
         }).join(', ')}</p>}
         {activeRole === 'Coordinator' && <div className="plan-footer"><small>{assignmentAlgorithmLabel} minimizes total route distance across feasible passable paths. {routeAlgorithmLabel} computes each route.</small><button className="button-primary" disabled={dispatchSubmitting} onClick={() => createDispatches(recommendation)}><Check size={16} /> {dispatchSubmitting ? 'Creating dispatches…' : 'Confirm dispatches'}</button></div>}
       </article>)}
-      {(recommendations.length > 0 || activeRole === 'Coordinator') && <section className="panel route-preview-panel"><div className="panel-header"><div><h3>Recommended graph routes</h3><p className="panel-subtitle">Route overlay uses {routeAlgorithmLabel.toLowerCase()}.</p></div><span className="map-legend"><i className="legend-route" /> Recommended route</span></div><div className="map-frame"><NetworkMap roads={roads} roadGeometries={roadGeometries} incidents={incidents} nodes={nodes} highlightedEdgeIds={highlightedEdgeIds} /><div className="map-caption">Route overlay computed by {routeAlgorithmLabel.toLowerCase()}{roads.some((road) => !roadGeometries[road.id]) ? '; straight graph links shown where street geometry is unavailable' : ''}.</div></div></section>}
+      {activeRole === 'Coordinator' && <section className="panel route-preview-panel">
+        <div className="panel-header">
+          <div><p className="eyebrow">Currently viewing</p><h3>{selectedDispatchMapRoute ? `Incident ${selectedDispatchMapRoute.assignment.incidentId} · ${selectedDispatchMapRoute.incident?.barangay || selectedDispatchMapRoute.assignment.incidentLabel}` : 'No active assigned route'}</h3><p className="panel-subtitle">Map displays only one active assigned route at a time.</p></div>
+          {activeAssignedDispatches.length > 0 && <label className="select-field map-incident-picker"><MapPin size={15} /><select aria-label="Select assigned incident route to show" value={selectedDispatchMapRoute?.dispatch.id || ''} onChange={(event) => setSelectedDispatchMapId(event.target.value)}>{activeAssignedDispatches.map(({ dispatch, assignment, incident }) => <option key={`${dispatch.id}-${assignment.incidentId}`} value={dispatch.id}>Incident {assignment.incidentId} · {incident?.barangay || assignment.incidentLabel}</option>)}</select></label>}
+        </div>
+        {selectedDispatchMapRoute ? <>
+          <p className="assigned-route-context">Point A: {selectedDispatchMapRoute.unit?.name || selectedDispatchMapRoute.assignment.unitName} → Point B: Incident {selectedDispatchMapRoute.assignment.incidentId} · {selectedDispatchMapRoute.incident?.barangay || selectedDispatchMapRoute.assignment.incidentLabel} · {selectedDispatchMapRoute.dispatch.status}</p>
+          <div className="map-legend"><i className="legend-incident" /> Selected incident <i className="legend-unit" /> Assigned unit <i className="legend-recommended" /> Recommended <i className="legend-passable" /> Passable <i className="legend-impassable" /> Blocked route</div>
+          <div className="map-frame"><NetworkMap roads={roads} nodes={nodes} incidents={selectedDispatchMapRoute.incident ? [selectedDispatchMapRoute.incident] : []} originUnit={selectedDispatchMapRoute.unit} routeEdgeIds={selectedDispatchMapRoute.assignment.edgeIds || []} routeNodeIds={selectedDispatchMapRoute.assignment.nodeIds || []} /><div className="map-caption">Red dashed connects Point A to the incident through an impassable road; it is not traversable.</div></div>
+        </> : <p className="empty-state">No incidents are currently assigned to a unit.</p>}
+      </section>}
       <section className="panel">{dispatchTable(dispatches)}</section>
     </>
 
@@ -559,8 +676,12 @@ function App() {
         <Metric icon={Clock3} label="Latest activity" value={logs[0]?.time || '—'} trend="System log" tone="green" />
       </section>
       <section className="overview-grid">
-        <div className="panel map-panel"><div className="panel-header"><div><h3>Road and incident map</h3><p className="panel-subtitle">Road nodes, edges, and incident locations</p></div><span className="map-legend"><i className="legend-incident" /> Incident <i className="legend-road-passable" /> Passable <i className="legend-blocked" /> Impassable <i className="legend-route" /> Recommended route</span></div>
-          <div className="map-frame"><NetworkMap roads={roads} roadGeometries={roadGeometries} incidents={incidents} nodes={nodes} highlightedEdgeIds={highlightedEdgeIds} active={activePage === 'overview'} /><div className="map-caption">{roads.some((road) => !roadGeometries[road.id]) ? 'Straight graph links shown where street geometry is unavailable; ' : 'Street geometry from OpenStreetMap; '}route distance uses {routeAlgorithmLabel.toLowerCase()}.</div></div>
+        <div className="panel map-panel"><div className="panel-header"><div><p className="eyebrow">Currently viewing</p><h3>{overviewRoute ? `Incident ${overviewRoute.assignment.incidentId} · ${overviewRoute.incident?.barangay || overviewRoute.assignment.incidentLabel}` : 'No active assigned route'}</h3><p className="panel-subtitle">Overview map is focused on an active assigned incident route.</p></div>{activeAssignedDispatches.length > 0 && <label className="select-field map-incident-picker"><MapPin size={15} /><select aria-label="Select overview assigned incident" value={overviewRoute?.dispatch.id || ''} onChange={(event) => setSelectedOverviewDispatchId(event.target.value)}>{activeAssignedDispatches.map(({ dispatch, assignment, incident }) => <option key={`${dispatch.id}-${assignment.incidentId}`} value={dispatch.id}>Incident {assignment.incidentId} · {incident?.barangay || assignment.incidentLabel}</option>)}</select></label>}</div>
+          {overviewRoute ? <>
+            <p className="assigned-route-context">Point A: {overviewRoute.unit?.name || overviewRoute.assignment.unitName} → Point B: Incident {overviewRoute.assignment.incidentId} · {overviewRoute.incident?.barangay || overviewRoute.assignment.incidentLabel} · {overviewRoute.dispatch.status}</p>
+            <div className="map-legend"><i className="legend-incident" /> Selected incident <i className="legend-unit" /> Assigned unit <i className="legend-recommended" /> Recommended <i className="legend-passable" /> Passable <i className="legend-impassable" /> Blocked route</div>
+            <div className="map-frame"><NetworkMap roads={roads} nodes={nodes} incidents={overviewRoute.incident ? [overviewRoute.incident] : []} originUnit={overviewRoute.unit} routeEdgeIds={overviewRoute.assignment.edgeIds || []} routeNodeIds={overviewRoute.assignment.nodeIds || []} active={activePage === 'overview'} /><div className="map-caption">Red dashed connects Point A to the incident through an impassable road; it is not traversable.</div></div>
+          </> : <p className="empty-state">No incidents are currently assigned to a unit. Pending and resolved incidents are excluded.</p>}
         </div>
         <div className="panel incident-panel"><div className="panel-header"><div><h3>Priority queue</h3><p className="panel-subtitle">Unresolved incidents by urgency</p></div><button className="text-button" onClick={() => setActivePage('incidents')}>View all <ArrowUpRight size={14} /></button></div>
           {incidents.slice().sort((first, second) => priorities.indexOf(first.priority) - priorities.indexOf(second.priority)).slice(0, 4).map((incident) => <div className="queue-item" key={incident.id}><div className={`queue-symbol ${incident.priority.toLowerCase()}`}><AlertTriangle size={16} /></div><div className="queue-copy"><strong>Incident {incident.id}</strong><span>Node {incident.locationNodeId ?? '—'} · {incident.status}</span></div><StatusPill tone={incident.priority.toLowerCase()}>{incident.priority}</StatusPill></div>)}
@@ -657,34 +778,68 @@ function App() {
   </div>
 }
 
-function NetworkMap({ roads, roadGeometries, incidents, nodes, highlightedEdgeIds = [], active = true }) {
-  const highlighted = new Set(highlightedEdgeIds.map(String))
+function NetworkMap({ roads, nodes, incidents, routeEdgeIds = [], routeNodeIds = [], originUnit, active = true }) {
+  const startNodeId = originUnit?.current_node_id ?? originUnit?.currentNodeId
+  const endNodeId = incidents[0]?.locationNodeId
+  const routeOptions = useMemo(
+    () => getMapRouteOptions(roads, startNodeId, endNodeId, routeEdgeIds, routeNodeIds),
+    [roads, startNodeId, endNodeId, routeEdgeIds, routeNodeIds],
+  )
+  const [routeGeometries, setRouteGeometries] = useState({})
+  const [routeGeometryError, setRouteGeometryError] = useState('')
 
-  return <MapContainer center={mapCenter} zoom={13} scrollWheelZoom={false} zoomControl>
-    <MapResizeHandler active={active} />
-    <TileLayer attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
-    {roads.map((road) => {
-      const positions = roadGeometries[road.id] || (road.from && road.to
-        ? [[Number(road.from.latitude), Number(road.from.longitude)], [Number(road.to.latitude), Number(road.to.longitude)]]
-        : null)
-      if (!positions) return null
-      const isRecommended = highlighted.has(String(road.id))
-      return <Polyline key={road.id} positions={positions} pathOptions={{
-        color: road.condition === 'Impassable' ? '#d3534b' : isRecommended ? '#db8b32' : '#137c8b',
-        weight: isRecommended ? 7 : 4,
-        dashArray: road.condition === 'Impassable' ? '8 8' : undefined,
-      }} />
-    })}
-    {incidents.map((incident) => <CircleMarker key={incident.id} center={incident.location} radius={incident.priority === 'Critical' ? 9 : 7} pathOptions={{ color: '#fff', weight: 2, fillColor: incident.priority === 'Critical' ? '#d94e48' : '#e4a335', fillOpacity: 1 }}>
-      <Popup><strong>Incident {incident.id}</strong><br />{incident.priority} urgency<br />Road node {incident.locationNodeId ?? 'not set'}</Popup>
-    </CircleMarker>)}
-    {nodes.map((node) => {
-      const id = node.node_id ?? node.nodeId ?? node.id
-      return <CircleMarker key={`node-${id}`} center={[Number(node.latitude), Number(node.longitude)]} radius={3} pathOptions={{ color: '#146d66', fillColor: '#fff', fillOpacity: 1 }}>
-        <Popup>Road node {id}</Popup>
-      </CircleMarker>
-    })}
-  </MapContainer>
+  useEffect(() => {
+    let cancelled = false
+
+    const loadRouteGeometries = async () => {
+      const results = await Promise.all(Object.entries(routeOptions).map(async ([type, route]) => {
+        if (!route?.nodeIds?.length) return [type, null, null]
+        try {
+          return [type, await api.getRouteGeometry(route.nodeIds, nodes), null]
+        } catch (geometryError) {
+          return [type, null, geometryError.message || 'Could not load road-following route geometry']
+        }
+      }))
+
+      if (cancelled) return
+      setRouteGeometries(Object.fromEntries(results.filter(([, positions]) => positions)))
+      setRouteGeometryError(results.find(([, , error]) => error)?.[2] || '')
+    }
+
+    loadRouteGeometries()
+    return () => { cancelled = true }
+  }, [nodes, routeOptions])
+
+  const routeLabels = {
+    recommended: 'Recommended route',
+    passable: 'Passable route',
+    impassable: 'Blocked route (includes impassable road)',
+  }
+  const routeStyles = {
+    impassable: { color: '#c84d47', weight: 5, opacity: 0.95, dashArray: '8 7', lineCap: 'butt', lineJoin: 'round' },
+    passable: { color: '#2875a0', weight: 7, opacity: 0.95, lineCap: 'round', lineJoin: 'round' },
+    recommended: { color: '#db8b32', weight: 4, opacity: 1, lineCap: 'round', lineJoin: 'round' },
+  }
+  const routeSegments = ['impassable', 'passable', 'recommended']
+    .filter((type) => routeOptions[type] && routeGeometries[type])
+  return <>
+    {routeGeometryError && <p className="map-route-error" role="status">{routeGeometryError}</p>}
+    <MapContainer center={mapCenter} zoom={13} scrollWheelZoom={false} zoomControl>
+      <MapResizeHandler active={active} />
+      <TileLayer attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+      {routeSegments.map((type) => (
+        <Polyline key={`route-${type}`} positions={routeGeometries[type]} pathOptions={routeStyles[type]}>
+          <Popup>{routeLabels[type]}</Popup>
+        </Polyline>
+      ))}
+      {incidents.map((incident) => <CircleMarker key={incident.id} center={incident.location} radius={incident.priority === 'Critical' ? 9 : 7} pathOptions={{ color: '#fff', weight: 2, fillColor: incident.priority === 'Critical' ? '#d94e48' : '#e4a335', fillOpacity: 1 }}>
+        <Popup><strong>Incident {incident.id}</strong><br />{incident.priority} urgency<br />Road node {incident.locationNodeId ?? 'not set'}</Popup>
+      </CircleMarker>)}
+      {originUnit?.location && <CircleMarker center={originUnit.location} radius={8} pathOptions={{ color: '#fff', weight: 2, fillColor: '#2875a0', fillOpacity: 1 }}>
+        <Popup><strong>{originUnit.name}</strong><br />Rescue unit · Point A</Popup>
+      </CircleMarker>}
+    </MapContainer>
+  </>
 }
 
 function PageHeading({ title, subtitle, action }) {

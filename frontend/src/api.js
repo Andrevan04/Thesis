@@ -36,6 +36,8 @@ const createDemoData = () => ({
     { edge_id: 3, from_node_id: 3, to_node_id: 4, is_passable: false },
     { edge_id: 4, from_node_id: 2, to_node_id: 5, is_passable: true },
     { edge_id: 5, from_node_id: 5, to_node_id: 4, is_passable: true },
+    { edge_id: 6, from_node_id: 5, to_node_id: 2, is_passable: true },
+    { edge_id: 7, from_node_id: 2, to_node_id: 4, is_passable: true },
   ],
   dispatches: [
     { dispatch_id: 1, unit_id: 2, incident_id: 2, assigned_by: 2, status: 'Assigned', route: { total_distance: 1.8, node_ids: [5, 4], edge_ids: [5] } },
@@ -61,7 +63,9 @@ const readDemoData = () => {
         ...initial,
         ...saved,
         nodes: Array.isArray(saved.nodes) ? saved.nodes : initial.nodes,
-        edges: Array.isArray(saved.edges) ? saved.edges : initial.edges,
+        edges: Array.isArray(saved.edges)
+          ? [...saved.edges, ...initial.edges.filter((edge) => !saved.edges.some((savedEdge) => Number(savedEdge.edge_id) === Number(edge.edge_id)))]
+          : initial.edges,
         incidents: saved.incidents.map((incident) => ({
           ...initial.incidents.find((item) => item.incident_id === Number(incident.incident_id)),
           ...incident,
@@ -611,6 +615,33 @@ export const getRoadGeometry = async (road) => {
   const geometry = body.code === 'Ok' ? body.routes?.[0]?.geometry?.coordinates : null
   const positions = Array.isArray(geometry) ? geometry.map(([longitude, latitude]) => [latitude, longitude]) : null
   if (!positions?.length) throw new Error('No road geometry returned')
+
+  roadGeometryCache.set(key, positions)
+  return positions
+}
+
+export const getRouteGeometry = async (nodeIds, nodes) => {
+  if (nodeIds.length < 2) return null
+  const nodeById = new Map(nodes.map((node) => [String(value(node, 'node_id', 'nodeId', 'id')), node]))
+  const coordinates = nodeIds.map((nodeId) => {
+    const node = nodeById.get(String(nodeId))
+    if (!node) throw new Error(`Road node ${nodeId} is not available for route mapping`)
+    const longitude = Number(value(node, 'longitude'))
+    const latitude = Number(value(node, 'latitude'))
+    if (!Number.isFinite(longitude) || !Number.isFinite(latitude)) {
+      throw new Error(`Road node ${nodeId} has invalid coordinates`)
+    }
+    return `${longitude},${latitude}`
+  })
+  const key = `route:${coordinates.join(';')}`
+  if (roadGeometryCache.has(key)) return roadGeometryCache.get(key)
+
+  const response = await fetch(`https://router.project-osrm.org/route/v1/driving/${coordinates.join(';')}?overview=full&geometries=geojson&steps=false`)
+  if (!response.ok) throw new Error(`Route geometry request failed: ${response.status}`)
+  const body = await response.json()
+  const geometry = body.code === 'Ok' ? body.routes?.[0]?.geometry?.coordinates : null
+  const positions = Array.isArray(geometry) ? geometry.map(([longitude, latitude]) => [latitude, longitude]) : null
+  if (!positions?.length) throw new Error('No road-following geometry returned for route')
 
   roadGeometryCache.set(key, positions)
   return positions
