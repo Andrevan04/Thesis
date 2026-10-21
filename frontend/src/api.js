@@ -15,8 +15,10 @@ const createDemoData = () => ({
     { node_id: 1, node_type: 'Operations center', latitude: 14.852, longitude: 120.815 },
     { node_id: 2, node_type: 'Road junction', latitude: 14.857, longitude: 120.821 },
     { node_id: 3, node_type: 'Evacuation area', latitude: 14.846, longitude: 120.827 },
-    { node_id: 4, node_type: 'Road junction', latitude: 14.839, longitude: 120.817 },
-    { node_id: 5, node_type: 'Community center', latitude: 14.861, longitude: 120.808 },
+    { node_id: 4, node_type: 'Road junction', latitude: 14.839747, longitude: 120.815885 },
+    { node_id: 5, node_type: 'Community center', latitude: 14.860767, longitude: 120.807717 },
+    { node_id: 6, node_type: 'Road junction', latitude: 14.851257, longitude: 120.818118 },
+    { node_id: 7, node_type: 'Road junction', latitude: 14.848848, longitude: 120.813924 },
   ],
   incidents: [
     { incident_id: 1, reported_by: 1, location_node_id: 3, people_affected: 8, barangay: 'Pamarawan', urgency_level: 'High', status: 'Pending' },
@@ -36,8 +38,10 @@ const createDemoData = () => ({
     { edge_id: 3, from_node_id: 3, to_node_id: 4, is_passable: false },
     { edge_id: 4, from_node_id: 2, to_node_id: 5, is_passable: true },
     { edge_id: 5, from_node_id: 5, to_node_id: 4, is_passable: true },
-    { edge_id: 6, from_node_id: 5, to_node_id: 2, is_passable: true },
-    { edge_id: 7, from_node_id: 2, to_node_id: 4, is_passable: true },
+    { edge_id: 6, from_node_id: 5, to_node_id: 6, is_passable: true },
+    { edge_id: 7, from_node_id: 6, to_node_id: 4, is_passable: true },
+    { edge_id: 8, from_node_id: 5, to_node_id: 7, is_passable: true },
+    { edge_id: 9, from_node_id: 7, to_node_id: 4, is_passable: false },
   ],
   dispatches: [
     { dispatch_id: 1, unit_id: 2, incident_id: 2, assigned_by: 2, status: 'Assigned', route: { total_distance: 1.8, node_ids: [5, 4], edge_ids: [5] } },
@@ -62,9 +66,21 @@ const readDemoData = () => {
       return {
         ...initial,
         ...saved,
-        nodes: Array.isArray(saved.nodes) ? saved.nodes : initial.nodes,
+        nodes: Array.isArray(saved.nodes)
+          ? [
+              ...saved.nodes.map((node) => ({
+                ...node,
+                ...initial.nodes.find((seedNode) => Number(seedNode.node_id) === Number(node.node_id)),
+              })),
+              ...initial.nodes.filter((seedNode) => !saved.nodes.some((node) => Number(node.node_id) === Number(seedNode.node_id))),
+            ]
+          : initial.nodes,
         edges: Array.isArray(saved.edges)
-          ? [...saved.edges, ...initial.edges.filter((edge) => !saved.edges.some((savedEdge) => Number(savedEdge.edge_id) === Number(edge.edge_id)))]
+          ? [
+              ...saved.edges.filter((savedEdge) => ![6, 7, 8, 9].includes(Number(savedEdge.edge_id))),
+              ...initial.edges.filter((edge) => [6, 7, 8, 9].includes(Number(edge.edge_id))),
+              ...saved.edges.filter((savedEdge) => !initial.edges.some((edge) => Number(edge.edge_id) === Number(savedEdge.edge_id))),
+            ]
           : initial.edges,
         incidents: saved.incidents.map((incident) => ({
           ...initial.incidents.find((item) => item.incident_id === Number(incident.incident_id)),
