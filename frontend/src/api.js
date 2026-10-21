@@ -1,5 +1,7 @@
 import munkres from 'munkres-js'
 import { getDemoRouteFixtures } from './demoRouteFixtures'
+import { assignUnreachableIncidents } from './demoDispatchAssignment'
+import { normalizeDemoStreetRoutes } from './demoStreetRoutes'
 import { normalizeRoadGeometry } from './roadGeometry'
 import { findRoadPath } from './routeOptimization'
 import { demoBarangayLocations } from './data/barangays'
@@ -14,6 +16,7 @@ const INCIDENT_COORDINATE_KEY = 'flood-dispatch-incident-coordinates'
 const BARANGAY_COORDINATE_KEY = 'flood-dispatch-barangay-coordinates'
 let demoMode = false
 const roadGeometryCache = new Map()
+const demoStreetRouteCache = new Map()
 
 const createDemoData = () => ({
   nodes: [
@@ -130,20 +133,25 @@ const readDemoData = () => {
           const route = dispatch.status !== 'Completed' && unit && incident
             ? demoShortestPath(routeData, unit.current_node_id, incident.location_node_id)
             : null
+          const preservedStreetRoute = !route
+            && dispatch.route?.source === 'demo-street'
+            && dispatch.route.geometry_positions?.length
           return {
             ...initialDispatch,
             ...dispatch,
             route: {
               ...initialDispatch?.route,
               ...dispatch.route,
-              ...(dispatch.status !== 'Completed'
+              ...(dispatch.status !== 'Completed' && route
                 ? {
                     total_distance: route?.distanceKm ?? 0,
                     node_ids: route?.nodeIds || [],
                     edge_ids: route?.edgeIds || [],
                     status: route ? 'Active' : 'Unreachable',
                   }
-                : {}),
+                : dispatch.status !== 'Completed' && !preservedStreetRoute
+                  ? { total_distance: 0, node_ids: [], edge_ids: [], status: 'Unreachable' }
+                  : {}),
             },
           }
         }) : initial.dispatches,
@@ -297,6 +305,7 @@ const demoDispatchRecommendations = () => {
       edgeIds: path.edgeIds,
     }]
   })
+  assignments.push(...assignUnreachableIncidents(units, incidents, assignments))
   const assignedIds = new Set(assignments.map((item) => Number(item.incidentId)))
   return {
     assignments,
@@ -686,7 +695,7 @@ export const updateRoad = async (id, condition) => {
   return body
 }
 
-export const createDispatch = async ({ unit_id, incident_id, assigned_by, distanceKm, nodeIds, edgeIds }) => {
+export const createDispatch = async ({ unit_id, incident_id, assigned_by, distanceKm, nodeIds, edgeIds, routeStatus, geometryPositions }) => {
   if (demoMode) {
     const data = readDemoData()
     const unit = data.units.find((item) => String(item.unit_id) === String(unit_id))
@@ -701,7 +710,13 @@ export const createDispatch = async ({ unit_id, incident_id, assigned_by, distan
       incident_id: Number(incident_id),
       assigned_by: Number(assigned_by ?? DEFAULT_USER_ID),
       status: 'Assigned',
-      route: { total_distance: distanceKm, node_ids: nodeIds, edge_ids: edgeIds, status: 'Active' },
+      route: {
+        total_distance: distanceKm,
+        node_ids: nodeIds,
+        edge_ids: edgeIds,
+        status: routeStatus || (nodeIds?.length ? 'Active' : 'Unreachable'),
+        ...(geometryPositions?.length ? { source: 'demo-street', geometry_positions: geometryPositions } : {}),
+      },
     }
     data.dispatches.unshift(dispatch)
     unit.status = 'Deployed'
@@ -720,6 +735,33 @@ export const createDispatch = async ({ unit_id, incident_id, assigned_by, distan
 }
 
 export const checkHealth = () => request('/health')
+
+export const getDemoStreetRoutes = async (start, end) => {
+  if (!demoMode) throw new Error('Street-router fallback is only available in prototype mode')
+  if (![...(start || []), ...(end || [])].every(Number.isFinite) || start.length !== 2 || end.length !== 2) {
+    throw new Error('Street-router fallback requires valid unit and incident coordinates')
+  }
+  const key = `${start.join(',')}->${end.join(',')}`
+  if (demoStreetRouteCache.has(key)) return demoStreetRouteCache.get(key)
+
+  const coordinates = [[start[1], start[0]], [end[1], end[0]]]
+    .map((coordinate) => coordinate.join(','))
+    .join(';')
+  const routeRequest = (async () => {
+    const response = await fetch(`https://router.project-osrm.org/route/v1/driving/${coordinates}?overview=full&geometries=geojson&steps=false&alternatives=true`)
+    if (!response.ok) throw new Error(`Street router request failed: ${response.status}`)
+    const body = await response.json()
+    if (body.code !== 'Ok') throw new Error(`Street router could not find a road route: ${body.code || 'unknown error'}`)
+    return normalizeDemoStreetRoutes(body.routes, start, end)
+  })()
+  demoStreetRouteCache.set(key, routeRequest)
+  try {
+    return await routeRequest
+  } catch (error) {
+    demoStreetRouteCache.delete(key)
+    throw error
+  }
+}
 
 export const getRoadGeometry = async (road) => {
   if (road.geometryPositions?.length) return road.geometryPositions
@@ -863,6 +905,33 @@ export const resetDemoData = () => {
 }
 
 export const getDispatchRecommendations = async () => {
-  if (demoMode) return demoDispatchRecommendations()
+  if (demoMode) {
+    const data = readDemoData()
+    const recommendations = demoDispatchRecommendations()
+    for (const assignment of recommendations.assignments) {
+      if (assignment.routeStatus !== 'Unreachable') continue
+      const unit = data.units.find((item) => String(item.unit_id) === assignment.unitId)
+      const incident = data.incidents.find((item) => String(item.incident_id) === assignment.incidentId)
+      const unitNode = data.nodes.find((item) => String(item.node_id) === String(unit?.current_node_id))
+      const incidentNode = data.nodes.find((item) => String(item.node_id) === String(incident?.location_node_id))
+      const start = unitNode && [Number(unitNode.latitude), Number(unitNode.longitude)]
+      const end = incident && incidentNode
+        ? [Number(incident.location_latitude ?? incidentNode.latitude), Number(incident.location_longitude ?? incidentNode.longitude)]
+        : null
+      if (!start || !end) continue
+
+      try {
+        const streetRoutes = await getDemoStreetRoutes(start, end)
+        assignment.distanceKm = streetRoutes.recommended.distanceKm
+        assignment.geometryPositions = streetRoutes.recommended.positions
+        assignment.alternativeGeometryPositions = streetRoutes.passable?.positions || null
+        assignment.alternativeDistanceKm = streetRoutes.passable?.distanceKm || null
+        assignment.routeStatus = 'Active'
+      } catch (routeError) {
+        assignment.routeError = routeError.message || 'Street route could not be loaded'
+      }
+    }
+    return recommendations
+  }
   return request('/dispatches/recommendations')
 }

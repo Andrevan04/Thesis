@@ -101,6 +101,8 @@ const assignPendingIncidentsToAvailableUnits = async () => {
         distanceKm: assignment.distanceKm ?? assignment.distance_km,
         nodeIds: assignment.nodeIds ?? assignment.node_ids ?? assignment.path ?? [],
         edgeIds: assignment.edgeIds ?? assignment.edge_ids ?? [],
+        routeStatus: assignment.routeStatus ?? assignment.route_status,
+        geometryPositions: assignment.geometryPositions ?? assignment.geometry_positions,
       }))
     }
     return created
@@ -313,9 +315,10 @@ function App() {
       setModal(false)
       await refresh()
       const assigned = await assignPendingIncidentsToAvailableUnits()
+      const routeFollowUpCount = assigned.filter((dispatch) => dispatch.route?.status === 'Unreachable').length
       setNotice(assigned.length
-        ? `Incident placed in ${barangay}; ${assigned.length} pending incident(s) assigned to available units and dispatchers`
-        : `Incident placed in ${barangay}, but no available unit has a feasible route`)
+        ? `Incident placed in ${barangay}; ${assigned.length} incident(s) assigned to available units and dispatchers${routeFollowUpCount ? `; ${routeFollowUpCount} route(s) need manual review` : ''}`
+        : `Incident placed in ${barangay}, but no available unit and dispatcher could be assigned`)
       await refresh()
       setActivePage('dispatches')
     } catch (requestError) {
@@ -371,6 +374,7 @@ function App() {
             && String(road.to_node_id ?? road.toNodeId) === String(nodeId)
             && road.condition === 'Passable')?.id
         )).filter((edgeId) => edgeId != null)
+        const routeStatus = assignment.routeStatus ?? assignment.route_status ?? (nodeIds.length ? 'Active' : 'Unreachable')
         const priority = assignment.priority || incident?.priority || 'Medium'
         return {
           ...assignment,
@@ -381,6 +385,10 @@ function App() {
           distanceKm: assignment.distanceKm ?? assignment.distance_km ?? null,
           nodeIds,
           edgeIds,
+          routeStatus,
+          geometryPositions: assignment.geometryPositions ?? assignment.geometry_positions,
+          alternativeGeometryPositions: assignment.alternativeGeometryPositions ?? assignment.alternative_geometry_positions,
+          alternativeDistanceKm: assignment.alternativeDistanceKm ?? assignment.alternative_distance_km,
           priority,
         }
       })
@@ -418,6 +426,8 @@ function App() {
         distanceKm: assignment.distanceKm,
         nodeIds: assignment.nodeIds,
         edgeIds: assignment.edgeIds,
+        routeStatus: assignment.routeStatus,
+        geometryPositions: assignment.geometryPositions,
       })))
       setRecommendations((current) => current.filter((item) => item.id !== recommendation.id))
       setNotice(`${created.length} dispatch record(s) created`)
@@ -678,7 +688,7 @@ function App() {
           const assignment = dispatch.assignments[0]
           return <tr key={dispatch.id} className={selectedDispatch?.id === dispatch.id ? 'selected-route-row' : ''}>
             <td><button className="route-select-button" type="button" aria-pressed={selectedDispatch?.id === dispatch.id} onClick={() => setSelectedAssignedDispatchId(dispatch.id)}><strong>{assignment.incidentLabel}</strong><small>Incident {assignment.incidentId}</small></button></td>
-            <td>{dispatch.routeStatus === 'Unreachable' ? 'No passable route' : assignment.nodeIds?.join(' → ') || 'Route details unavailable'}</td><td>{dispatch.routeStatus === 'Unreachable' ? '—' : assignment.distanceKm != null ? `${Number(assignment.distanceKm).toFixed(2)} km` : assignment.eta}</td><td><StatusPill tone={dispatch.routeStatus === 'Unreachable' ? 'blocked' : dispatch.status.toLowerCase().replace(' ', '-')}>{dispatch.routeStatus === 'Unreachable' ? 'Route blocked' : dispatch.status}</StatusPill></td><td><select className="inline-select" aria-label={`Update dispatch ${dispatch.dispatchId} status`} value={dispatch.status} onChange={(event) => updateDispatch(dispatch.dispatchId, event.target.value)}><option>Assigned</option><option>En route</option><option>Completed</option></select></td></tr>
+            <td>{dispatch.routeStatus === 'Unreachable' ? 'No passable route' : assignment.nodeIds?.join(' → ') || (assignment.distanceKm != null ? 'Mapped street route' : 'Route details unavailable')}</td><td>{dispatch.routeStatus === 'Unreachable' ? '—' : assignment.distanceKm != null ? `${Number(assignment.distanceKm).toFixed(2)} km` : assignment.eta}</td><td><StatusPill tone={dispatch.routeStatus === 'Unreachable' ? 'blocked' : dispatch.status.toLowerCase().replace(' ', '-')}>{dispatch.routeStatus === 'Unreachable' ? 'Route blocked' : dispatch.status}</StatusPill></td><td><select className="inline-select" aria-label={`Update dispatch ${dispatch.dispatchId} status`} value={dispatch.status} onChange={(event) => updateDispatch(dispatch.dispatchId, event.target.value)}><option>Assigned</option><option>En route</option><option>Completed</option></select></td></tr>
         })}</tbody></table>{!assignedRoutes.length && <p className="empty-state">{pendingIncidents.length
           ? `${pendingIncidents.length} pending incident(s) are waiting for the coordinator to generate and confirm dispatch assignments. Your ${assignedUnit?.name || `Rescue Unit ${activeUser.unitId}`} route will appear here after confirmation.`
           : `No active route is currently assigned to ${assignedUnit?.name || `Rescue Unit ${activeUser.unitId}`}.`}</p>}</div></section>
@@ -849,6 +859,7 @@ function NetworkMap({ roads, incidents, originUnit, active = true, demoMode = fa
     [routeRoads, startNodeId, incidentLocationNodeId],
   )
   const [routeGeometries, setRouteGeometries] = useState({})
+  const [streetRouteOptions, setStreetRouteOptions] = useState(null)
   const [routeGeometryError, setRouteGeometryError] = useState('')
 
   useEffect(() => {
@@ -881,6 +892,7 @@ function NetworkMap({ roads, incidents, originUnit, active = true, demoMode = fa
 
     const loadRouteGeometries = async () => {
       setRouteGeometries({})
+      setStreetRouteOptions(null)
       const routeEntries = [
         ['recommended', routeOptions.recommended],
         ['passable', routeOptions.passable],
@@ -915,8 +927,23 @@ function NetworkMap({ roads, incidents, originUnit, active = true, demoMode = fa
         }
       }))
 
+      let directStreetRoutes = null
+      let directStreetRouteError = ''
+      if (demoMode && !routeOptions.recommended
+        && Array.isArray(originLocation) && Array.isArray(incidentLocation)) {
+        try {
+          directStreetRoutes = await api.getDemoStreetRoutes(originLocation, incidentLocation)
+        } catch (streetRouteError) {
+          directStreetRouteError = streetRouteError.message || 'No road-following route could be loaded'
+        }
+      }
+
       if (cancelled) return
       const geometries = Object.fromEntries(results.filter(([, positions]) => positions))
+      if (directStreetRoutes) {
+        geometries.recommended = directStreetRoutes.recommended.positions
+        if (directStreetRoutes.passable) geometries.passable = directStreetRoutes.passable.positions
+      }
       if (geometries.recommended && geometries.passable
         && geometries.recommended.length === geometries.passable.length
         && geometries.recommended.every(([latitude, longitude], index) => (
@@ -933,23 +960,33 @@ function NetworkMap({ roads, incidents, originUnit, active = true, demoMode = fa
         if (!geometries.impassable.length) delete geometries.impassable
       }
       setRouteGeometries(geometries)
+      setStreetRouteOptions(directStreetRoutes)
       const routeError = results.find(([, , error]) => error)?.[2]
-      const hasRoute = Object.values(routeOptions).some(Boolean)
-      setRouteGeometryError(routeError || (!hasRoute
+      const hasRoute = Object.values(routeOptions).some(Boolean) || Boolean(directStreetRoutes)
+      setRouteGeometryError(routeError || directStreetRouteError || (!hasRoute
         ? 'No routes available: the selected unit and incident have no connected path with valid road distance and passability data.'
         : ''))
     }
 
     loadRouteGeometries()
     return () => { cancelled = true }
-  }, [routeRoads, routeOptions, incidentLocation, originLocation])
+  }, [routeRoads, routeOptions, incidentLocation, originLocation, demoMode])
 
+  const displayedRouteOptions = {
+    recommended: routeOptions.recommended || (streetRouteOptions
+      ? { distanceKm: streetRouteOptions.recommended.distanceKm }
+      : null),
+    passable: routeOptions.passable || (streetRouteOptions?.passable
+      ? { distanceKm: streetRouteOptions.passable.distanceKm }
+      : null),
+    impassable: routeOptions.impassable,
+  }
   const hasSimulatedBlockedRoute = routeOptions.impassable?.edgeIds.some((edgeId) => (
     routeRoads.find((road) => String(road.id) === String(edgeId))?.demoRouteFixture
   ))
   const routeLabels = {
-    recommended: `Recommended route · shortest passable (${routeOptions.recommended?.distanceKm?.toFixed(2) ?? '—'} km)`,
-    passable: `Passable · longer alternative (${routeOptions.passable?.distanceKm?.toFixed(2) ?? '—'} km)`,
+    recommended: `Recommended route · shortest passable (${displayedRouteOptions.recommended?.distanceKm?.toFixed(2) ?? '—'} km)`,
+    passable: `Passable · longer alternative (${displayedRouteOptions.passable?.distanceKm?.toFixed(2) ?? '—'} km)`,
     impassable: hasSimulatedBlockedRoute
       ? 'Simulated blocked route to the selected incident'
       : `Blocked route via impassable road edge ${routeOptions.impassable?.blockedEdgeId ?? '—'}`,
@@ -960,12 +997,12 @@ function NetworkMap({ roads, incidents, originUnit, active = true, demoMode = fa
     recommended: { color: recommendedRouteColor, weight: 6, opacity: 1, lineCap: 'round', lineJoin: 'round' },
   }
   const routeSegments = ['impassable', 'passable', 'recommended']
-    .filter((type) => routeOptions[type] && routeGeometries[type]?.length)
+    .filter((type) => displayedRouteOptions[type] && routeGeometries[type]?.length)
   const unavailableRouteTypes = [
-    !routeOptions.passable && 'longer passable alternative',
+    !displayedRouteOptions.passable && 'longer passable alternative',
     !routeOptions.impassable && 'connected impassable route',
   ].filter(Boolean)
-  const routeAvailabilityNote = routeOptions.recommended && unavailableRouteTypes.length
+  const routeAvailabilityNote = displayedRouteOptions.recommended && unavailableRouteTypes.length
     ? `Loaded road data has no ${unavailableRouteTypes.join(' or ')} for this unit and incident.`
     : ''
   const routePanes = {
