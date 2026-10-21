@@ -87,7 +87,8 @@ const loadRoadNetwork = async (database) => {
         to_node_id,
         is_passable,
         distance_km,
-        travel_time_minutes
+        travel_time_minutes,
+        geometry_geojson
       FROM road_edge
     `),
   ]);
@@ -113,7 +114,7 @@ app.get('/api/health', asyncRoute(async (_req, res) => {
 
 app.get('/api/incidents', requireDatabase, tableList(
   'incident i LEFT JOIN road_node n ON n.node_id = i.location_node_id',
-  'i.incident_id, i.reported_by, i.location_node_id, i.people_affected, i.urgency_level, i.status, n.node_type, n.latitude, n.longitude',
+  'i.incident_id, i.reported_by, i.location_node_id, i.people_affected, i.urgency_level, i.status, i.barangay, i.location_latitude, i.location_longitude, n.node_type, n.latitude, n.longitude',
   'i.incident_id DESC',
 ))
 
@@ -124,17 +125,30 @@ app.post('/api/incidents', requireDatabase, asyncRoute(async (req, res) => {
     people_affected,
     urgency_level,
     reported_by,
+    barangay,
+    location_latitude,
+    location_longitude,
     status = 'Pending',
   } = req.body;
 
+  const hasLatitude = location_latitude !== undefined && location_latitude !== null && location_latitude !== ''
+  const hasLongitude = location_longitude !== undefined && location_longitude !== null && location_longitude !== ''
+  const latitude = hasLatitude ? Number(location_latitude) : null
+  const longitude = hasLongitude ? Number(location_longitude) : null
   if (
     !positiveId(location_node_id) ||
     !positiveId(people_affected) ||
     !positiveId(reported_by) ||
-    !['Critical', 'High', 'Medium', 'Low'].includes(urgency_level)
+    !['Critical', 'High', 'Medium', 'Low'].includes(urgency_level) ||
+    (hasLatitude !== hasLongitude) ||
+    (hasLatitude && (
+      !Number.isFinite(latitude) || latitude < -90 || latitude > 90 ||
+      !Number.isFinite(longitude) || longitude < -180 || longitude > 180
+    )) ||
+    (barangay !== undefined && (typeof barangay !== 'string' || !barangay.trim()))
   ) {
     return res.status(400).json({
-      message: 'location_node_id, people_affected, reported_by, and a valid urgency_level are required',
+      message: 'Valid location_node_id, people_affected, reported_by, urgency_level, and paired geographic coordinates are required',
     });
   }
 
@@ -147,16 +161,21 @@ app.post('/api/incidents', requireDatabase, asyncRoute(async (req, res) => {
 
     const { rows } = await client.query(
       `INSERT INTO incident
-        (reported_by, location_node_id, people_affected, urgency_level, status)
-       VALUES ($1, $2, $3, $4, $5)
+        (reported_by, location_node_id, people_affected, urgency_level, status,
+         barangay, location_latitude, location_longitude)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING incident_id, reported_by, location_node_id,
-                 people_affected, urgency_level, status`,
+                 people_affected, urgency_level, status, barangay,
+                 location_latitude, location_longitude`,
       [
         Number(reported_by),
         Number(location_node_id),
         Number(people_affected),
         urgency_level,
         status,
+        typeof barangay === 'string' ? barangay.trim() : null,
+        latitude,
+        longitude,
       ],
     );
 
@@ -293,7 +312,7 @@ app.get('/api/roads/nodes', requireDatabase, tableList(
 
 app.get('/api/roads/edges', requireDatabase, tableList(
   'road_edge',
-  'edge_id, from_node_id, to_node_id, is_passable, distance_km',
+  'edge_id, from_node_id, to_node_id, is_passable, distance_km, geometry_geojson',
   'edge_id',
 ))
 
@@ -306,7 +325,7 @@ app.patch('/api/roads/edges/:id', requireDatabase, asyncRoute(async (req, res) =
   try {
     await client.query('BEGIN')
     const { rows } = await client.query(
-      'UPDATE road_edge SET is_passable = $1 WHERE edge_id = $2 RETURNING edge_id, from_node_id, to_node_id, is_passable, distance_km',
+      'UPDATE road_edge SET is_passable = $1 WHERE edge_id = $2 RETURNING edge_id, from_node_id, to_node_id, is_passable, distance_km, geometry_geojson',
       [is_passable, Number(req.params.id)],
     )
     if (!rows.length) {

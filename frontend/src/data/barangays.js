@@ -51,3 +51,29 @@ export const malolosBarangays = [
   'Taal',
   'Tikay',
 ]
+
+export const demoBarangays = [
+  'Guinhawa',
+  'Catmon',
+  'Bulihan',
+  'Mojon',
+  'San Vicente (Poblacion)',
+  'Tikay',
+  'Dakila',
+  'Atlag',
+  'Bangkal',
+  'Santo Rosario (Poblacion)',
+]
+
+export const demoBarangayLocations = {
+  Guinhawa: { latitude: 14.857662, longitude: 120.814045 },
+  Catmon: { latitude: 14.854871, longitude: 120.811433 },
+  Bulihan: { latitude: 14.862076, longitude: 120.806557 },
+  Mojon: { latitude: 14.866191, longitude: 120.813845 },
+  'San Vicente (Poblacion)': { latitude: 14.841474, longitude: 120.812272 },
+  Tikay: { latitude: 14.840909, longitude: 120.853198 },
+  Dakila: { latitude: 14.85126, longitude: 120.835154 },
+  Atlag: { latitude: 14.829974, longitude: 120.818234 },
+  Bangkal: { latitude: 14.82364, longitude: 120.845272 },
+  'Santo Rosario (Poblacion)': { latitude: 14.838561, longitude: 120.810393 },
+}

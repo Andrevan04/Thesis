@@ -132,7 +132,7 @@ button { color: inherit; }
 .map-legend i { display: inline-block; flex: 0 0 auto; }
 .legend-incident { background: #d95349; margin-left: 4px; }
 .map-legend .legend-incident { border: 2px solid #fff; border-radius: 50%; box-shadow: 0 0 0 1px #d95349; height: 8px; width: 8px; }
-.legend-unit { background: #2875a0; border: 1px solid #fff; border-radius: 50%; box-shadow: 0 0 0 1px #2875a0; height: 8px; margin-left: 4px; width: 8px; }
+.legend-unit { background: #1769aa; border: 1px solid #fff; border-radius: 50%; box-shadow: 0 0 0 1px #1769aa; height: 8px; margin-left: 4px; width: 8px; }
 .legend-recommended, .legend-passable, .legend-impassable { border-top: 4px solid; height: 0; margin-left: 4px; width: 17px; }
 .legend-recommended { border-color: #db8b32; }
 .legend-passable { border-color: #2875a0; }
@@ -141,6 +141,7 @@ button { color: inherit; }
 .map-incident-picker select { max-width: 190px; }
 .map-frame { position: relative; }
 .map-route-error { background: #fff4ef; border-radius: 4px; color: #a04d40; font-size: 9px; margin: 0 0 7px; padding: 6px 8px; }
+.map-route-note { background: #f3f7f8; border-radius: 4px; color: #62747c; font-size: 9px; margin: 0 0 7px; padding: 6px 8px; }
 .map-frame .leaflet-container { background: #dde9e5; border-radius: 6px; font: inherit; height: 294px; isolation: isolate; width: 100%; z-index: 0; }
 .map-frame .leaflet-control-attribution { font-size: 8px; }
 .map-caption { background: rgba(255,255,255,.92); border-radius: 4px; bottom: 9px; color: #667c82; font-size: 8px; left: 9px; padding: 4px 6px; pointer-events: none; position: absolute; z-index: 400; }

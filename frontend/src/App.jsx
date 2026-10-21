@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { MapContainer, TileLayer, CircleMarker, Popup, Polyline, useMap } from 'react-leaflet'
+import { MapContainer, TileLayer, CircleMarker, Popup, Polyline, Tooltip, Pane, useMap } from 'react-leaflet'
 import {
   Activity,
   AlertTriangle,
@@ -27,10 +27,14 @@ import {
 import 'leaflet/dist/leaflet.css'
 import './App.css'
 import * as api from './api'
-import { malolosBarangays } from './data/barangays'
+import { demoBarangays, malolosBarangays } from './data/barangays'
+import { getDemoRouteFixtures } from './demoRouteFixtures'
+import { removeOverlappingRouteSegments } from './routeOverlap'
+import { getMapRouteOptions as optimizeMapRoutes } from './routeOptimization'
 
 const mapCenter = [14.852, 120.815]
 const priorities = ['Critical', 'High', 'Medium', 'Low']
+const recommendedRouteColor = '#db8b32'
 const routeAlgorithmLabel = 'Dijkstra shortest-path search'
 const assignmentAlgorithmLabel = 'Hungarian assignment optimization'
 const fieldResponderRole = 'Field Responder / Dispatcher'
@@ -43,6 +47,9 @@ const initialDemoUsers = [
   { id: '1', name: 'Mara Cruz', email: 'coordinator@cdrrmo.malolos.gov.ph', role: 'Coordinator', active: true },
   { id: '2', name: 'Rico Santos', email: 'responder@cdrrmo.malolos.gov.ph', role: fieldResponderRole, unitId: '2', active: true },
   { id: '3', name: 'Lia Mendoza', email: 'admin@cdrrmo.malolos.gov.ph', role: 'Administrator', active: true },
+  { id: '4', name: 'Sofia Reyes', email: 'dispatcher1@cdrrmo.malolos.gov.ph', role: fieldResponderRole, unitId: '1', active: true },
+  { id: '5', name: 'Miguel Dela Cruz', email: 'dispatcher3@cdrrmo.malolos.gov.ph', role: fieldResponderRole, unitId: '3', active: true },
+  { id: '6', name: 'Ana Bautista', email: 'dispatcher4@cdrrmo.malolos.gov.ph', role: fieldResponderRole, unitId: '4', active: true },
 ]
 
 const loadLocalJson = (key, fallback) => {
@@ -50,6 +57,59 @@ const loadLocalJson = (key, fallback) => {
     return JSON.parse(window.localStorage.getItem(key)) ?? fallback
   } catch {
     return fallback
+  }
+}
+
+const loadDemoUsers = () => {
+  const savedUsers = loadLocalJson('flood-dispatch-demo-users', [])
+  const savedById = new Map(savedUsers.map((user) => [String(user.id), user]))
+  const seededIds = new Set(initialDemoUsers.map((user) => user.id))
+  const seededUsers = initialDemoUsers.map((user) => {
+    const savedUser = savedById.get(user.id)
+    return {
+      ...user,
+      ...savedUser,
+      role: user.role,
+      ...(user.unitId ? { unitId: user.unitId } : {}),
+    }
+  })
+  return [
+    ...seededUsers,
+    ...savedUsers.filter((user) => !seededIds.has(String(user.id))).map((user) => ({
+      ...user,
+      role: user.role === 'Field Responder' ? fieldResponderRole : user.role,
+    })),
+  ]
+}
+
+let pendingAssignmentPromise = null
+
+const assignPendingIncidentsToAvailableUnits = async () => {
+  if (pendingAssignmentPromise) return pendingAssignmentPromise
+
+  pendingAssignmentPromise = (async () => {
+    const result = await api.getDispatchRecommendations()
+    if (!Array.isArray(result.assignments)) {
+      throw new Error('The recommendation service returned an invalid assignment list')
+    }
+    const created = []
+    for (const assignment of result.assignments) {
+      created.push(await api.createDispatch({
+        unit_id: assignment.unitId ?? assignment.unit_id,
+        incident_id: assignment.incidentId ?? assignment.incident_id,
+        assigned_by: 1,
+        distanceKm: assignment.distanceKm ?? assignment.distance_km,
+        nodeIds: assignment.nodeIds ?? assignment.node_ids ?? assignment.path ?? [],
+        edgeIds: assignment.edgeIds ?? assignment.edge_ids ?? [],
+      }))
+    }
+    return created
+  })()
+
+  try {
+    return await pendingAssignmentPromise
+  } finally {
+    pendingAssignmentPromise = null
   }
 }
 
@@ -65,111 +125,23 @@ function MapResizeHandler({ active }) {
   return null
 }
 
+function MapViewport({ positions }) {
+  const map = useMap()
+
+  useEffect(() => {
+    if (!positions.length) return
+    if (positions.length === 1) {
+      map.setView(positions[0], 13)
+      return
+    }
+    map.fitBounds(positions, { padding: [36, 36], maxZoom: 13 })
+  }, [map, positions])
+
+  return null
+}
+
 function StatusPill({ children, tone = '' }) {
   return <span className={`status-pill ${tone}`}>{children}</span>
-}
-
-const findRoadPath = (roads, startNodeId, endNodeId, { excludedEdgeIds = new Set() } = {}) => {
-  const start = String(startNodeId ?? '')
-  const end = String(endNodeId ?? '')
-  if (!start || !end) return null
-  if (start === end) return { distanceKm: 0, nodeIds: [start], edgeIds: [] }
-
-  const adjacency = new Map()
-  for (const road of roads) {
-    const fromId = String(road.from_node_id ?? road.fromNodeId ?? road.from?.node_id ?? road.from?.nodeId ?? road.from?.id ?? '')
-    const toId = String(road.to_node_id ?? road.toNodeId ?? road.to?.node_id ?? road.to?.nodeId ?? road.to?.id ?? '')
-    const edgeId = String(road.id ?? road.edge_id ?? road.edgeId ?? '')
-    const distanceKm = Number(road.distanceKm)
-    if (!fromId || !toId || !edgeId || road.distanceKm == null || excludedEdgeIds.has(edgeId) || road.condition !== 'Passable' || !Number.isFinite(distanceKm) || distanceKm < 0) continue
-    if (!adjacency.has(fromId)) adjacency.set(fromId, [])
-    adjacency.get(fromId).push({ edgeId, fromId, toId, distanceKm })
-  }
-
-  const distances = new Map([[start, 0]])
-  const previous = new Map()
-  const visited = new Set()
-
-  while (true) {
-    let currentNodeId = null
-    let bestDistance = Infinity
-    for (const [nodeId, distance] of distances) {
-      if (!visited.has(nodeId) && distance < bestDistance) {
-        currentNodeId = nodeId
-        bestDistance = distance
-      }
-    }
-    if (currentNodeId === null) break
-    if (currentNodeId === end) break
-
-    visited.add(currentNodeId)
-    for (const edge of adjacency.get(currentNodeId) || []) {
-      const nextDistance = bestDistance + edge.distanceKm
-      if (nextDistance < (distances.get(edge.toId) ?? Infinity)) {
-        distances.set(edge.toId, nextDistance)
-        previous.set(edge.toId, { nodeId: currentNodeId, edgeId: edge.edgeId })
-      }
-    }
-  }
-
-  if (!distances.has(end)) return null
-  const nodeIds = [end]
-  const edgeIds = []
-  let currentNodeId = end
-  while (currentNodeId !== start) {
-    const step = previous.get(currentNodeId)
-    if (!step) return null
-    edgeIds.unshift(step.edgeId)
-    nodeIds.unshift(step.nodeId)
-    currentNodeId = step.nodeId
-  }
-  return { distanceKm: distances.get(end), nodeIds, edgeIds }
-}
-
-const getMapRouteOptions = (roads, startNodeId, endNodeId, assignedEdgeIds, assignedNodeIds) => {
-  const recommended = findRoadPath(roads, startNodeId, endNodeId)
-  const route = recommended || (assignedEdgeIds.length && assignedEdgeIds.every((id) => roads.find((road) => String(road.id) === String(id))?.condition === 'Passable')
-    ? { edgeIds: assignedEdgeIds.map(String), nodeIds: assignedNodeIds, distanceKm: null }
-    : null)
-  const passable = []
-  const seenPaths = new Set(route ? [route.edgeIds.join(',')] : [])
-
-  if (recommended) {
-    for (const edgeId of recommended.edgeIds) {
-      const alternative = findRoadPath(roads, startNodeId, endNodeId, { excludedEdgeIds: new Set([edgeId]) })
-      if (!alternative || alternative.distanceKm <= recommended.distanceKm + 1e-6) continue
-      const pathKey = alternative.edgeIds.join(',')
-      if (seenPaths.has(pathKey)) continue
-      seenPaths.add(pathKey)
-      passable.push(alternative)
-    }
-  }
-
-  passable.sort((first, second) => first.distanceKm - second.distanceKm)
-  const blockedConnections = roads.flatMap((blockedRoad) => {
-    if (blockedRoad.condition !== 'Impassable') return []
-    const fromNodeId = blockedRoad.from_node_id ?? blockedRoad.fromNodeId ?? blockedRoad.from?.node_id ?? blockedRoad.from?.nodeId ?? blockedRoad.from?.id
-    const toNodeId = blockedRoad.to_node_id ?? blockedRoad.toNodeId ?? blockedRoad.to?.node_id ?? blockedRoad.to?.nodeId ?? blockedRoad.to?.id
-    const blockedEdgeId = String(blockedRoad.id ?? blockedRoad.edge_id ?? blockedRoad.edgeId ?? '')
-    const blockedDistance = Number(blockedRoad.distanceKm)
-    if (!fromNodeId || !toNodeId || !blockedEdgeId || !Number.isFinite(blockedDistance) || blockedDistance < 0) return []
-
-    const approach = findRoadPath(roads, startNodeId, fromNodeId)
-    const departure = findRoadPath(roads, toNodeId, endNodeId)
-    if (!approach || !departure || approach.nodeIds.some((nodeId) => departure.nodeIds.includes(nodeId))) return []
-
-    return [{
-      distanceKm: approach.distanceKm + blockedDistance + departure.distanceKm,
-      nodeIds: [...approach.nodeIds, String(toNodeId), ...departure.nodeIds.slice(1)],
-      edgeIds: [...approach.edgeIds, blockedEdgeId, ...departure.edgeIds],
-      blockedEdgeIds: [blockedEdgeId],
-    }]
-  }).sort((first, second) => first.distanceKm - second.distanceKm)
-  return {
-    recommended: route,
-    passable: passable[0] || null,
-    impassable: blockedConnections[0] || null,
-  }
 }
 
 function App() {
@@ -185,10 +157,7 @@ function App() {
   const [selectedOverviewDispatchId, setSelectedOverviewDispatchId] = useState('')
   const [selectedDispatchMapId, setSelectedDispatchMapId] = useState('')
   const [selectedAssignedDispatchId, setSelectedAssignedDispatchId] = useState('')
-  const [demoUsers, setDemoUsers] = useState(() => loadLocalJson('flood-dispatch-demo-users', initialDemoUsers).map((user) => ({
-    ...user,
-    role: user.role === 'Field Responder' ? fieldResponderRole : user.role,
-  })))
+  const [demoUsers, setDemoUsers] = useState(loadDemoUsers)
   const [activeUserId, setActiveUserId] = useState(() => loadLocalJson('flood-dispatch-active-user', '1'))
   const [isAuthenticated, setIsAuthenticated] = useState(() => Boolean(loadLocalJson('flood-dispatch-demo-session', null)))
   const [loginPassword, setLoginPassword] = useState('')
@@ -219,17 +188,51 @@ function App() {
       setDispatches(data.plans)
       setIsDemoMode(data.source === 'demo')
       setError(data.source === 'demo' ? '' : data.errors.length ? `Unavailable routes: ${data.errors.join('; ')}` : '')
+      return data
     } catch (loadError) {
       setError(loadError.message || 'Could not load API data')
       setNotice('Unable to load data. Check the backend service and API response format.')
+      return null
     } finally {
       setLoading(false)
     }
   }
 
+  const refreshAndAssign = async () => {
+    const data = await refresh()
+    if (!data) return null
+    try {
+      const created = await assignPendingIncidentsToAvailableUnits()
+      if (created.length) {
+        setNotice(`${created.length} pending incident(s) automatically assigned to available units and dispatchers`)
+        await refresh()
+      }
+      return created
+    } catch (assignmentError) {
+      setNotice(assignmentError.message || 'Could not automatically assign pending incidents')
+      return null
+    }
+  }
+
   useEffect(() => {
-    const timer = window.setTimeout(refresh, 0)
-    return () => window.clearTimeout(timer)
+    let cancelled = false
+    const timer = window.setTimeout(async () => {
+      const data = await refresh()
+      if (cancelled || !data) return
+      try {
+        const created = await assignPendingIncidentsToAvailableUnits()
+        if (!cancelled && created.length) {
+          setNotice(`${created.length} pending incident(s) automatically assigned to available units and dispatchers`)
+          await refresh()
+        }
+      } catch (assignmentError) {
+        if (!cancelled) setNotice(assignmentError.message || 'Could not automatically assign pending incidents')
+      }
+    }, 0)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
   }, [])
 
   useEffect(() => {
@@ -264,13 +267,19 @@ function App() {
     const incident = incidents.find((item) => item.id === assignment.incidentId)
     const unit = units.find((item) => item.id === assignment.unitId)
     return { dispatch, assignment, incident, unit }
-  })).filter(({ dispatch, incident }) => (
+  })).filter(({ dispatch, assignment, incident }) => (
     String(dispatch.status).toLowerCase() !== 'completed'
     && ['assigned', 'in progress'].includes(String(incident?.status).toLowerCase())
+    && (activeRole !== fieldResponderRole || String(activeUser.unitId) === String(assignment.unitId))
   ))
+  const presentationRoute = isDemoMode
+    ? activeAssignedDispatches.find(({ assignment }) => assignment.incidentId === '2')
+    : null
   const overviewRoute = activeAssignedDispatches.find(({ dispatch }) => dispatch.id === selectedOverviewDispatchId)
+    || presentationRoute
     || activeAssignedDispatches[0]
   const selectedDispatchMapRoute = activeAssignedDispatches.find(({ dispatch }) => dispatch.id === selectedDispatchMapId)
+    || presentationRoute
     || activeAssignedDispatches[0]
   const allNavItems = [
     { id: 'overview', label: 'Overview', icon: LayoutDashboard },
@@ -284,7 +293,7 @@ function App() {
   ]
   const navItems = allNavItems.filter((item) => rolePages[activeRole]?.includes(item.id))
   const pageTitle = navItems.find((item) => item.id === activePage)?.label || 'Overview'
-  const visibleBarangays = malolosBarangays.filter((barangay) => barangay.toLowerCase().includes(barangaySearch.toLowerCase()))
+  const visibleBarangays = demoBarangays.filter((barangay) => barangay.toLowerCase().includes(barangaySearch.toLowerCase()))
 
   const addIncident = async (event) => {
     event.preventDefault()
@@ -292,17 +301,23 @@ function App() {
     setIncidentSubmitting(true)
     try {
       const barangay = form.get('barangay')
-      const locationNodeId = await api.resolveBarangayNodeId(barangay, nodes)
+      const { locationNodeId, location } = await api.resolveBarangayLocation(barangay, nodes)
       await api.createIncident({
         location_node_id: locationNodeId,
+        location_latitude: location[0],
+        location_longitude: location[1],
         people_affected: form.get('people_affected'),
         barangay,
         urgency_level: form.get('urgency_level'),
       })
       setModal(false)
-      setNotice(`Incident created and mapped to nearest road node ${locationNodeId}`)
       await refresh()
-      await recommendDispatches(false)
+      const assigned = await assignPendingIncidentsToAvailableUnits()
+      setNotice(assigned.length
+        ? `Incident placed in ${barangay}; ${assigned.length} pending incident(s) assigned to available units and dispatchers`
+        : `Incident placed in ${barangay}, but no available unit has a feasible route`)
+      await refresh()
+      setActivePage('dispatches')
     } catch (requestError) {
       setNotice(requestError.message || 'Could not create incident')
     } finally {
@@ -313,9 +328,10 @@ function App() {
   const changeUnitStatus = async (unitId, status) => {
     try {
       await api.updateUnit(unitId, status)
-      setNotice('Unit status updated')
       await refresh()
-      await recommendDispatches(false)
+      const assigned = await assignPendingIncidentsToAvailableUnits()
+      setNotice(assigned.length ? `Unit updated; ${assigned.length} pending incident(s) assigned` : 'Unit status updated')
+      if (assigned.length) await refresh()
     } catch (requestError) {
       setNotice(requestError.message || 'Could not update unit')
     }
@@ -326,11 +342,13 @@ function App() {
       const result = await api.updateRoad(edgeId, passable ? 'Passable' : 'Impassable')
       const rerouted = result.reroutedDispatchIds?.length || 0
       const unreachable = result.unreachableDispatchIds?.length || 0
-      setNotice(unreachable
-        ? `Road updated; ${rerouted} route(s) rerouted and ${unreachable} dispatch(es) have no passable route`
-        : rerouted ? `Road updated; ${rerouted} active route(s) rerouted` : 'Road passability updated')
       await refresh()
-      await recommendDispatches(false)
+      const assigned = await assignPendingIncidentsToAvailableUnits()
+      setNotice(unreachable
+        ? `Road updated; ${rerouted} route(s) rerouted and ${unreachable} dispatch(es) have no passable route${assigned.length ? `; ${assigned.length} pending incident(s) assigned` : ''}`
+        : assigned.length ? `Road updated; ${assigned.length} pending incident(s) assigned to available units`
+          : rerouted ? `Road updated; ${rerouted} active route(s) rerouted` : 'Road passability updated')
+      if (assigned.length) await refresh()
     } catch (requestError) {
       setNotice(requestError.message || 'Could not update road edge')
     }
@@ -370,9 +388,11 @@ function App() {
       if (!assignments.length) {
         setRecommendations([])
         const unassignedIncidentIds = result.unassignedIncidentIds ?? result.unassigned_incident_ids ?? []
-        if (navigateToDispatches) setNotice(unassignedIncidentIds.length || incidents.some((incident) => incident.status.toLowerCase() === 'pending')
-          ? 'No feasible assignments: check available units, capacity, and passable roads'
-          : 'No pending incidents')
+        if (unassignedIncidentIds.length || incidents.some((incident) => incident.status.toLowerCase() === 'pending')) {
+          setNotice('Incident saved, but no feasible assignment was found. Check unit capacity and passable roads.')
+        } else if (navigateToDispatches) {
+          setNotice('No pending incidents')
+        }
         return
       }
 
@@ -402,7 +422,6 @@ function App() {
       setRecommendations((current) => current.filter((item) => item.id !== recommendation.id))
       setNotice(`${created.length} dispatch record(s) created`)
       await refresh()
-      await recommendDispatches(false)
     } catch (requestError) {
       setNotice(requestError.message || 'Could not create dispatch')
     } finally {
@@ -413,8 +432,11 @@ function App() {
   const resetSampleData = async () => {
     api.resetDemoData()
     setRecommendations([])
-    setNotice('Sample data reset')
-    await refresh()
+    const created = await refreshAndAssign()
+    if (created === null) return
+    setNotice(created.length
+      ? `Sample data reset; ${created.length} pending incident(s) automatically assigned`
+      : 'Sample data reset')
   }
 
   const changeActiveUser = (userId) => {
@@ -472,9 +494,12 @@ function App() {
   const updateDispatch = async (dispatchId, status) => {
     try {
       await api.updateDispatchStatus(dispatchId, status)
-      setNotice(`Dispatch ${dispatchId} marked ${status.toLowerCase()}`)
       await refresh()
-      await recommendDispatches(false)
+      const assigned = await assignPendingIncidentsToAvailableUnits()
+      setNotice(assigned.length
+        ? `Dispatch ${dispatchId} marked ${status.toLowerCase()}; ${assigned.length} pending incident(s) assigned`
+        : `Dispatch ${dispatchId} marked ${status.toLowerCase()}`)
+      if (assigned.length) await refresh()
     } catch (requestError) {
       setNotice(requestError.message || 'Could not update route status')
     }
@@ -502,16 +527,22 @@ function App() {
   const incidentsTable = (items) => (
     <div className="table-scroll">
       <table className="data-table">
-        <thead><tr><th>Incident ID</th><th>Urgency</th><th>Location node</th><th>Affected residents</th><th>Status</th></tr></thead>
-        <tbody>{items.map((incident) => (
-          <tr key={incident.id}>
+        <thead><tr><th>Incident ID</th><th>Urgency</th><th>Location node</th><th>Affected residents</th><th>Status</th><th>Assigned dispatcher</th></tr></thead>
+        <tbody>{items.map((incident) => {
+          const assignment = dispatches.flatMap((dispatch) => dispatch.assignments || [])
+            .find((item) => item.incidentId === incident.id)
+          const dispatcher = demoUsers.find((user) => (
+            user.role === fieldResponderRole && String(user.unitId) === String(assignment?.unitId)
+          ))
+          return <tr key={incident.id}>
             <td><strong>Incident {incident.id}</strong><small>{incident.barangay}</small></td>
             <td><StatusPill tone={incident.priority.toLowerCase()}>{incident.priority}</StatusPill></td>
             <td>{incident.locationNodeId ?? '—'}</td>
             <td>{incident.people}</td>
             <td><StatusPill tone={incident.status.toLowerCase().replace(' ', '-')}>{incident.status}</StatusPill></td>
+            <td>{assignment ? dispatcher?.name || `Rescue Unit ${assignment.unitId}` : '—'}</td>
           </tr>
-        ))}</tbody>
+        })}</tbody>
       </table>
       {!items.length && <p className="empty-state">No incidents to display.</p>}
     </div>
@@ -581,12 +612,13 @@ function App() {
       <form className="panel account-form" onSubmit={addDemoUser}>
         <label>Full name<input name="name" autoComplete="off" required /></label>
         <label>Email<input name="email" type="email" autoComplete="off" required /></label>
-        <label>Role<select name="role" defaultValue="Coordinator"><option>Coordinator</option><option>{fieldResponderRole}</option><option>Administrator</option></select></label>
+        <label>Role<select name="role" defaultValue="Coordinator"><option>Coordinator</option><option>Administrator</option></select></label>
         <button className="button-primary" type="submit"><Plus size={15} /> Add account</button>
       </form>
-      <section className="panel"><div className="table-scroll"><table className="data-table"><thead><tr><th>Demo user</th><th>Prototype role</th><th>Role permissions</th><th>Account</th><th>Action</th></tr></thead><tbody>{demoUsers.map((user) => <tr key={user.id}>
+      <section className="panel"><div className="table-scroll"><table className="data-table"><thead><tr><th>Demo user</th><th>Prototype role</th><th>Assigned rescue unit</th><th>Role permissions</th><th>Account</th><th>Action</th></tr></thead><tbody>{demoUsers.map((user) => <tr key={user.id}>
         <td><strong>{user.name}</strong><small>{user.email}</small></td>
-        <td><select className="inline-select" aria-label={`Change role for ${user.name}`} value={user.role} onChange={(event) => changeDemoUserRole(user.id, event.target.value)}><option>Coordinator</option><option>{fieldResponderRole}</option><option>Administrator</option></select></td>
+        <td>{user.role === fieldResponderRole ? fieldResponderRole : <select className="inline-select" aria-label={`Change role for ${user.name}`} value={user.role} onChange={(event) => changeDemoUserRole(user.id, event.target.value)}><option>Coordinator</option><option>Administrator</option></select>}</td>
+        <td>{user.unitId ? units.find((unit) => unit.id === String(user.unitId))?.name || `Rescue Unit ${user.unitId}` : '—'}</td>
         <td>{user.role === 'Coordinator' ? 'Incidents, roads, units, dispatch recommendations' : user.role === fieldResponderRole ? 'Assigned routes, route status, road reports' : 'User roles, accounts, system logs'}</td>
         <td><StatusPill tone={user.active === false ? 'blocked' : 'available'}>{user.active === false ? 'Disabled' : 'Active'}</StatusPill></td>
         <td><button className="button-secondary account-toggle" type="button" disabled={user.id === activeUser?.id || (user.active !== false && activeDemoUsers.length <= 1)} onClick={() => toggleDemoUser(user.id)}>{user.active === false ? 'Enable' : 'Disable'}</button></td>
@@ -594,10 +626,10 @@ function App() {
     </>
 
     if (activePage === 'barangays') return <>
-      <PageHeading title="Barangays" subtitle="All 51 barangays in the City of Malolos, Bulacan." action={<button className="button-primary" onClick={() => setModal(true)}><Plus size={16} /> New incident</button>} />
+      <PageHeading title="Barangays" subtitle="Prototype area: 10 barangays around Bulacan State University. Other barangays are outside this demo scope." action={<button className="button-primary" onClick={() => setModal(true)}><Plus size={16} /> New incident</button>} />
       <div className="toolbar">
         <label className="search-field"><Search size={16} /><input value={barangaySearch} onChange={(event) => setBarangaySearch(event.target.value)} placeholder="Search barangay" /></label>
-        <span className="muted">{malolosBarangays.length} barangays</span>
+        <span className="muted">{demoBarangays.length} demo barangays</span>
       </div>
       <section className="panel"><div className="table-scroll"><table className="data-table"><thead><tr><th>Barangay</th><th>Total incidents</th><th>Open incidents</th></tr></thead><tbody>{visibleBarangays.map((barangay) => {
         const records = incidents.filter((incident) => incident.barangay === barangay)
@@ -633,19 +665,23 @@ function App() {
       const selectedAssignment = selectedDispatch?.assignments.find((assignment) => assignment.unitId === String(activeUser.unitId))
       const selectedIncident = incidents.find((incident) => incident.id === selectedAssignment?.incidentId)
       const selectedRouteUnit = units.find((unit) => unit.id === selectedAssignment?.unitId)
+      const assignedUnit = units.find((unit) => unit.id === String(activeUser.unitId))
+      const pendingIncidents = incidents.filter((incident) => incident.status.toLowerCase() === 'pending')
       return <>
-        <PageHeading title="My assigned routes" subtitle="Update dispatch progress and share road observations with the coordinator." action={<label className="select-field responder-unit-picker"><Truck size={15} /><select aria-label="Select assigned rescue unit" value={activeUser.unitId || ''} onChange={(event) => setDemoUsers((current) => current.map((user) => user.id === activeUser.id ? { ...user, unitId: event.target.value } : user))}>{units.map((unit) => <option key={unit.id} value={unit.id}>{unit.name}</option>)}</select></label>} />
+        <PageHeading title="My assigned routes" subtitle={`Dispatcher for ${assignedUnit?.name || `Rescue Unit ${activeUser.unitId}`}. View and update routes assigned to this unit only.`} action={<span className="select-field responder-unit-picker"><Truck size={15} /> {assignedUnit?.name || `Rescue Unit ${activeUser.unitId}`}</span>} />
         {selectedDispatch && selectedAssignment && <section className="panel route-selection-panel">
           <div className="panel-header"><div><p className="eyebrow">Currently viewing</p><h3>Incident {selectedAssignment.incidentId} · {selectedIncident?.barangay || selectedAssignment.incidentLabel}</h3><p className="panel-subtitle">Point A: {selectedAssignment.unitName} · Node {selectedRouteUnit?.current_node_id ?? selectedRouteUnit?.currentNodeId ?? '—'} → Point B: Incident {selectedAssignment.incidentId} · Node {selectedIncident?.locationNodeId ?? '—'}</p></div><StatusPill tone={selectedDispatch.routeStatus === 'Unreachable' ? 'blocked' : 'available'}>{selectedDispatch.routeStatus === 'Unreachable' ? 'Route blocked' : selectedDispatch.status}</StatusPill></div>
-          <div className="map-legend"><i className="legend-recommended" /> Recommended <i className="legend-passable" /> Passable <i className="legend-impassable" /> Blocked route</div>
-          <div className="map-frame"><NetworkMap roads={roads} nodes={nodes} incidents={selectedIncident ? [selectedIncident] : []} originUnit={selectedRouteUnit} routeEdgeIds={selectedAssignment.edgeIds || []} routeNodeIds={selectedAssignment.nodeIds || []} /><div className="map-caption">Red dashed connects Point A to the incident through an impassable road; it is not traversable.</div></div>
+          <div className="map-legend"><i className="legend-recommended" /> Recommended route <i className="legend-passable" /> Passable <i className="legend-impassable" /> Impassable</div>
+          <div className="map-frame"><NetworkMap roads={roads} incidents={selectedIncident ? [selectedIncident] : []} originUnit={selectedRouteUnit} demoMode={isDemoMode} /><div className="map-caption">{isDemoMode ? 'Routes follow mapped streets from the assigned unit to the selected incident; demo passability and blocked conditions are simulated.' : 'Routes connect the assigned unit to the selected incident along connected road edges; red dashed marks an impassable route.'}</div></div>
         </section>}
         <section className="panel"><div className="table-scroll"><table className="data-table"><thead><tr><th>Incident</th><th>Route</th><th>Distance</th><th>Dispatch status</th><th>Update</th></tr></thead><tbody>{assignedRoutes.map((dispatch) => {
           const assignment = dispatch.assignments[0]
           return <tr key={dispatch.id} className={selectedDispatch?.id === dispatch.id ? 'selected-route-row' : ''}>
             <td><button className="route-select-button" type="button" aria-pressed={selectedDispatch?.id === dispatch.id} onClick={() => setSelectedAssignedDispatchId(dispatch.id)}><strong>{assignment.incidentLabel}</strong><small>Incident {assignment.incidentId}</small></button></td>
             <td>{dispatch.routeStatus === 'Unreachable' ? 'No passable route' : assignment.nodeIds?.join(' → ') || 'Route details unavailable'}</td><td>{dispatch.routeStatus === 'Unreachable' ? '—' : assignment.distanceKm != null ? `${Number(assignment.distanceKm).toFixed(2)} km` : assignment.eta}</td><td><StatusPill tone={dispatch.routeStatus === 'Unreachable' ? 'blocked' : dispatch.status.toLowerCase().replace(' ', '-')}>{dispatch.routeStatus === 'Unreachable' ? 'Route blocked' : dispatch.status}</StatusPill></td><td><select className="inline-select" aria-label={`Update dispatch ${dispatch.dispatchId} status`} value={dispatch.status} onChange={(event) => updateDispatch(dispatch.dispatchId, event.target.value)}><option>Assigned</option><option>En route</option><option>Completed</option></select></td></tr>
-        })}</tbody></table>{!assignedRoutes.length && <p className="empty-state">No routes are assigned to this demo user.</p>}</div></section>
+        })}</tbody></table>{!assignedRoutes.length && <p className="empty-state">{pendingIncidents.length
+          ? `${pendingIncidents.length} pending incident(s) are waiting for the coordinator to generate and confirm dispatch assignments. Your ${assignedUnit?.name || `Rescue Unit ${activeUser.unitId}`} route will appear here after confirmation.`
+          : `No active route is currently assigned to ${assignedUnit?.name || `Rescue Unit ${activeUser.unitId}`}.`}</p>}</div></section>
       </>
     }
 
@@ -667,22 +703,22 @@ function App() {
         </div>
         {selectedDispatchMapRoute ? <>
           <p className="assigned-route-context">Point A: {selectedDispatchMapRoute.unit?.name || selectedDispatchMapRoute.assignment.unitName} → Point B: Incident {selectedDispatchMapRoute.assignment.incidentId} · {selectedDispatchMapRoute.incident?.barangay || selectedDispatchMapRoute.assignment.incidentLabel} · {selectedDispatchMapRoute.dispatch.status}</p>
-          <div className="map-legend"><i className="legend-incident" /> Selected incident <i className="legend-unit" /> Assigned unit <i className="legend-recommended" /> Recommended <i className="legend-passable" /> Passable <i className="legend-impassable" /> Blocked route</div>
-          <div className="map-frame"><NetworkMap roads={roads} nodes={nodes} incidents={selectedDispatchMapRoute.incident ? [selectedDispatchMapRoute.incident] : []} originUnit={selectedDispatchMapRoute.unit} routeEdgeIds={selectedDispatchMapRoute.assignment.edgeIds || []} routeNodeIds={selectedDispatchMapRoute.assignment.nodeIds || []} /><div className="map-caption">Red dashed connects Point A to the incident through an impassable road; it is not traversable.</div></div>
+          <div className="map-legend"><i className="legend-incident" /> Selected incident <i className="legend-unit" /> Assigned unit <i className="legend-recommended" /> Recommended route <i className="legend-passable" /> Passable <i className="legend-impassable" /> Impassable</div>
+          <div className="map-frame"><NetworkMap roads={roads} incidents={selectedDispatchMapRoute.incident ? [selectedDispatchMapRoute.incident] : []} originUnit={selectedDispatchMapRoute.unit} demoMode={isDemoMode} /><div className="map-caption">{isDemoMode ? 'Routes follow mapped streets from the assigned unit to the selected incident; demo passability and blocked conditions are simulated.' : 'Routes connect the assigned unit to the selected incident along connected road edges; red dashed marks an impassable route.'}</div></div>
         </> : <p className="empty-state">No incidents are currently assigned to a unit.</p>}
       </section>}
       <section className="panel">{dispatchTable(dispatches)}</section>
     </>
 
     if (activePage === 'logs') return <>
-      <PageHeading title="System activity" subtitle="Actions recorded in the system log." action={<button className="button-secondary" onClick={refresh}><RefreshCw size={15} /> Refresh</button>} />
+      <PageHeading title="System activity" subtitle="Actions recorded in the system log." action={<button className="button-secondary" onClick={refreshAndAssign}><RefreshCw size={15} /> Refresh</button>} />
       <section className="panel"><div className="activity-list">{logs.map((log) => <div className="activity-row" key={log.id}><span className="activity-marker" /><div><strong>{log.text}</strong><small>{logActorLabel(log)}</small></div><time>{log.time}</time></div>)}</div></section>
     </>
 
     return <>
-      <PageHeading title="Dispatch overview" subtitle="Network-based flood response coordination · Malolos, Bulacan" action={<><button className="button-secondary" onClick={refresh}><RefreshCw size={15} /> Refresh</button>{activeRole === 'Coordinator' && <button className="button-primary" onClick={recommendDispatches}><Route size={16} /> Recommend assignments</button>}</>} />
+      <PageHeading title="Dispatch overview" subtitle="Network-based flood response coordination · Malolos, Bulacan" action={<><button className="button-secondary" onClick={refreshAndAssign}><RefreshCw size={15} /> Refresh</button>{activeRole === 'Coordinator' && <button className="button-primary" onClick={recommendDispatches}><Route size={16} /> Recommend assignments</button>}</>} />
       {isDemoMode && <div className="sample-banner"><AlertTriangle size={17} /><span><strong>Demo mode</strong> Local sample records are active; changes are saved only in this browser.</span><button onClick={resetSampleData}>Reset sample</button></div>}
-      {error && !isDemoMode && <div className="sample-banner"><AlertTriangle size={17} /><span><strong>API notice</strong> {error}</span><button onClick={refresh}>Retry</button></div>}
+      {error && !isDemoMode && <div className="sample-banner"><AlertTriangle size={17} /><span><strong>API notice</strong> {error}</span><button onClick={refreshAndAssign}>Retry</button></div>}
       <div className="sample-banner"><AlertTriangle size={17} /><span><strong>Decision support only</strong> Verify field reports and approve dispatch decisions with authorized coordinators.</span></div>
       <section className="metric-grid">
         <Metric icon={ShieldAlert} label="Open incidents" value={String(openIncidents).padStart(2, '0')} trend="Needs review" tone="red" />
@@ -694,8 +730,8 @@ function App() {
         <div className="panel map-panel"><div className="panel-header"><div><p className="eyebrow">Currently viewing</p><h3>{overviewRoute ? `Incident ${overviewRoute.assignment.incidentId} · ${overviewRoute.incident?.barangay || overviewRoute.assignment.incidentLabel}` : 'No active assigned route'}</h3><p className="panel-subtitle">Overview map is focused on an active assigned incident route.</p></div>{activeAssignedDispatches.length > 0 && <label className="select-field map-incident-picker"><MapPin size={15} /><select aria-label="Select overview assigned incident" value={overviewRoute?.dispatch.id || ''} onChange={(event) => setSelectedOverviewDispatchId(event.target.value)}>{activeAssignedDispatches.map(({ dispatch, assignment, incident }) => <option key={`${dispatch.id}-${assignment.incidentId}`} value={dispatch.id}>Incident {assignment.incidentId} · {incident?.barangay || assignment.incidentLabel}</option>)}</select></label>}</div>
           {overviewRoute ? <>
             <p className="assigned-route-context">Point A: {overviewRoute.unit?.name || overviewRoute.assignment.unitName} → Point B: Incident {overviewRoute.assignment.incidentId} · {overviewRoute.incident?.barangay || overviewRoute.assignment.incidentLabel} · {overviewRoute.dispatch.status}</p>
-            <div className="map-legend"><i className="legend-incident" /> Selected incident <i className="legend-unit" /> Assigned unit <i className="legend-recommended" /> Recommended <i className="legend-passable" /> Passable <i className="legend-impassable" /> Blocked route</div>
-            <div className="map-frame"><NetworkMap roads={roads} nodes={nodes} incidents={overviewRoute.incident ? [overviewRoute.incident] : []} originUnit={overviewRoute.unit} routeEdgeIds={overviewRoute.assignment.edgeIds || []} routeNodeIds={overviewRoute.assignment.nodeIds || []} active={activePage === 'overview'} /><div className="map-caption">Red dashed connects Point A to the incident through an impassable road; it is not traversable.</div></div>
+            <div className="map-legend"><i className="legend-incident" /> Selected incident <i className="legend-unit" /> Assigned unit <i className="legend-recommended" /> Recommended route <i className="legend-passable" /> Passable <i className="legend-impassable" /> Impassable</div>
+            <div className="map-frame"><NetworkMap roads={roads} incidents={overviewRoute.incident ? [overviewRoute.incident] : []} originUnit={overviewRoute.unit} active={activePage === 'overview'} demoMode={isDemoMode} /><div className="map-caption">{isDemoMode ? 'Routes follow mapped streets from the assigned unit to the selected incident; demo passability and blocked conditions are simulated.' : 'Routes connect the assigned unit to the selected incident along connected road edges; red dashed marks an impassable route.'}</div></div>
           </> : <p className="empty-state">No incidents are currently assigned to a unit. Pending and resolved incidents are excluded.</p>}
         </div>
         <div className="panel incident-panel"><div className="panel-header"><div><h3>Priority queue</h3><p className="panel-subtitle">Unresolved incidents by urgency</p></div><button className="text-button" onClick={() => setActivePage('incidents')}>View all <ArrowUpRight size={14} /></button></div>
@@ -755,7 +791,7 @@ function App() {
       <div className="sidebar-section"><span className="sidebar-label">WORKSPACE</span><nav className="nav">{navItems.map(({ id, label, icon: Icon }) => <button key={id} className={`nav-item ${activePage === id ? 'active' : ''}`} onClick={() => { setActivePage(id); setSidebarOpen(false) }}><Icon size={17} /><span>{label}</span>{id === 'incidents' && openIncidents > 0 && <span className="nav-count">{openIncidents}</span>}</button>)}</nav></div>
       <div className="sidebar-bottom"><div className="alert-level"><span className="alert-level-dot" /><div><small>OPERATIONAL STATUS</small><strong>{error ? 'Service issue' : isDemoMode ? 'Demo simulation' : 'Monitoring active'}</strong></div></div><div className="sidebar-foot"><span>Flood response support</span><span>Prototype · Local data</span></div></div>
     </aside>
-    <main className="main-panel"><header className="topbar"><div className="topbar-title"><button className="mobile-menu" aria-label="Open navigation" aria-expanded={sidebarOpen} onClick={() => setSidebarOpen(true)}><Menu size={19} /></button><div><div className="breadcrumb">Operations <span>/</span> {pageTitle}</div><h1>{pageTitle}</h1></div></div><div className="topbar-tools"><label className="role-picker light-role-picker"><span>Demo profile</span><select aria-label="Switch demo profile" value={activeUser?.id || ''} onChange={(event) => changeActiveUser(event.target.value)}>{demoUsers.map((user) => <option key={user.id} value={user.id}>{user.name} · {user.role}</option>)}</select></label><button className="icon-button notification-button" title="Notifications" aria-label={`Notifications, ${notifications.filter((item) => !item.read).length} unread`} aria-expanded={notificationsOpen} onClick={toggleNotifications}><Bell size={18} />{notifications.some((item) => !item.read) && <i />}</button><button className="icon-button" title="Refresh data" aria-label="Refresh data" onClick={refresh}><RefreshCw size={18} /></button><button className="icon-button" title="Sign out" aria-label="Sign out" onClick={signOut}><LogOut size={17} /></button></div></header>
+    <main className="main-panel"><header className="topbar"><div className="topbar-title"><button className="mobile-menu" aria-label="Open navigation" aria-expanded={sidebarOpen} onClick={() => setSidebarOpen(true)}><Menu size={19} /></button><div><div className="breadcrumb">Operations <span>/</span> {pageTitle}</div><h1>{pageTitle}</h1></div></div><div className="topbar-tools"><label className="role-picker light-role-picker"><span>Demo profile</span><select aria-label="Switch demo profile" value={activeUser?.id || ''} onChange={(event) => changeActiveUser(event.target.value)}>{demoUsers.map((user) => <option key={user.id} value={user.id}>{user.name} · {user.role}</option>)}</select></label><button className="icon-button notification-button" title="Notifications" aria-label={`Notifications, ${notifications.filter((item) => !item.read).length} unread`} aria-expanded={notificationsOpen} onClick={toggleNotifications}><Bell size={18} />{notifications.some((item) => !item.read) && <i />}</button><button className="icon-button" title="Refresh data" aria-label="Refresh data" onClick={refreshAndAssign}><RefreshCw size={18} /></button><button className="icon-button" title="Sign out" aria-label="Sign out" onClick={signOut}><LogOut size={17} /></button></div></header>
       {notificationsOpen && <aside className="notification-panel" aria-label="Notification center"><div className="panel-header"><div><h3>Notification center</h3><p className="panel-subtitle">Local prototype alerts</p></div><button className="icon-button" aria-label="Close notifications" onClick={() => setNotificationsOpen(false)}><X size={16} /></button></div>{notifications.map((notification) => <article className={`notification-item ${notification.read ? 'read' : ''}`} key={notification.notification_id}><span className="activity-marker" /><div><strong>{notification.title}</strong><p>{notification.message}</p><time>{notification.time}</time></div></article>)}{!notifications.length && <p className="empty-state">No notifications.</p>}</aside>}
       {isDemoMode && <div className="prototype-notice"><AlertTriangle size={14} /> Prototype mode: profiles and permissions are simulated locally; this is not secure authentication.</div>}
       <div className="page-content">{loading ? <div className="loading-state">Loading prototype data...</div> : pageContent()}<footer className="page-footer"><span>Decision support prototype · Final dispatch decisions remain with authorized coordinators.</span><button onClick={() => setNotice('All prototype changes are stored in this browser only')}>Prototype information</button></footer></div>
@@ -771,13 +807,18 @@ function App() {
           <label>Barangay
             <select name="barangay" required defaultValue="">
               <option value="" disabled>Select a barangay</option>
-              {malolosBarangays.map((barangay) => <option key={barangay}>{barangay}</option>)}
+              {demoBarangays.map((barangay) => <option key={barangay}>{barangay}</option>)}
+              <optgroup label="Outside the prototype area · disabled">
+                {malolosBarangays.filter((barangay) => !demoBarangays.includes(barangay)).map((barangay) => (
+                  <option key={barangay} value={barangay} disabled>{barangay}</option>
+                ))}
+              </optgroup>
             </select>
           </label>
           <label>Affected residents
             <input name="people_affected" type="number" min="1" step="1" required defaultValue="1" />
           </label>
-          <p className="form-note">The barangay location will be matched to the nearest road-network node.</p>
+          <p className="form-note">The map pin uses the barangay's mapped location; routing uses its nearest road-network node.</p>
           <label>Urgency level
             <select name="urgency_level" defaultValue="Medium">
               {priorities.map((priority) => <option key={priority}>{priority}</option>)}
@@ -793,12 +834,19 @@ function App() {
   </div>
 }
 
-function NetworkMap({ roads, nodes, incidents, routeEdgeIds = [], routeNodeIds = [], originUnit, active = true }) {
+function NetworkMap({ roads, incidents, originUnit, active = true, demoMode = false }) {
   const startNodeId = originUnit?.current_node_id ?? originUnit?.currentNodeId
-  const endNodeId = incidents[0]?.locationNodeId
+  const incidentLocation = incidents[0]?.location
+  const incidentLocationNodeId = incidents[0]?.locationNodeId
+  const originLocation = originUnit?.location
+  const routeRoads = useMemo(() => {
+    if (!demoMode) return roads
+    const fixtures = getDemoRouteFixtures(startNodeId, incidentLocationNodeId, originLocation, incidentLocation)
+    return fixtures.length ? fixtures : roads
+  }, [demoMode, roads, startNodeId, incidentLocationNodeId, originLocation, incidentLocation])
   const routeOptions = useMemo(
-    () => getMapRouteOptions(roads, startNodeId, endNodeId, routeEdgeIds, routeNodeIds),
-    [roads, startNodeId, endNodeId, routeEdgeIds, routeNodeIds],
+    () => optimizeMapRoutes(routeRoads, startNodeId, incidentLocationNodeId),
+    [routeRoads, startNodeId, incidentLocationNodeId],
   )
   const [routeGeometries, setRouteGeometries] = useState({})
   const [routeGeometryError, setRouteGeometryError] = useState('')
@@ -806,64 +854,161 @@ function NetworkMap({ roads, nodes, incidents, routeEdgeIds = [], routeNodeIds =
   useEffect(() => {
     let cancelled = false
 
-    const loadRouteGeometries = async () => {
-      const results = await Promise.all(Object.entries(routeOptions).map(async ([type, route]) => {
-        if (!route?.nodeIds?.length) return [type, null, null]
-        const nodePositions = route.nodeIds.map((nodeId) => {
-          const node = nodes.find((item) => String(item.node_id ?? item.nodeId ?? item.id) === String(nodeId))
-          const latitude = Number(node?.latitude)
-          const longitude = Number(node?.longitude)
-          return Number.isFinite(latitude) && Number.isFinite(longitude) ? [latitude, longitude] : null
-        })
-        if (nodePositions.length !== route.nodeIds.length || nodePositions.some((position) => !position)) {
-          return [type, null, 'Route geometry is unavailable because a road node has invalid coordinates']
+    const loadPathGeometry = async (route, edgeIds = route.edgeIds) => {
+      if (!route || !edgeIds?.length) return null
+      const edgeRecords = edgeIds.map((edgeId) => routeRoads.find((road) => String(road.id) === String(edgeId)))
+      if (edgeRecords.some((road) => !road)) throw new Error('A route edge is missing from the current road network')
+      const positionsByEdge = await Promise.all(edgeRecords.map((road) => api.getRoadGeometry(road)))
+      if (positionsByEdge.some((positions) => !positions?.length)) {
+        throw new Error('Road geometry is unavailable for one or more route edges')
+      }
+      return positionsByEdge.reduce((combined, positions) => {
+        if (!combined.length) return [...positions]
+        const [lastLatitude, lastLongitude] = combined[combined.length - 1]
+        const [firstLatitude, firstLongitude] = positions[0]
+        if (Math.abs(lastLatitude - firstLatitude) > 1e-7 || Math.abs(lastLongitude - firstLongitude) > 1e-7) {
+          throw new Error('Road geometry edges do not connect at the route junction')
         }
+        return [...combined, ...positions.slice(1)]
+      }, [])
+    }
+    const reachesMapMarker = (position, marker) => {
+      if (!Array.isArray(marker) || marker.length !== 2) return false
+      const latitudeKm = (position[0] - marker[0]) * 111
+      const longitudeKm = (position[1] - marker[1]) * 111 * Math.cos(marker[0] * Math.PI / 180)
+      return Math.hypot(latitudeKm, longitudeKm) <= 0.05
+    }
+
+    const loadRouteGeometries = async () => {
+      setRouteGeometries({})
+      const routeEntries = [
+        ['recommended', routeOptions.recommended],
+        ['passable', routeOptions.passable],
+        ['impassable', routeOptions.impassable],
+      ]
+      const results = await Promise.all(routeEntries.map(async ([type, route]) => {
+        if (!route) return [type, null, null]
         try {
-          return [type, await api.getRouteGeometry(route.nodeIds, nodes), null]
+          const validEdges = route.edgeIds.every((edgeId, index) => {
+            const road = routeRoads.find((item) => String(item.id) === String(edgeId))
+            const expectedCondition = type === 'impassable' && String(edgeId) === String(route.blockedEdgeId)
+              ? 'Impassable'
+              : 'Passable'
+            return road?.condition === expectedCondition
+              && String(road.from_node_id ?? road.fromNodeId ?? road.from?.node_id ?? road.from?.nodeId ?? road.from?.id) === route.nodeIds[index]
+              && String(road.to_node_id ?? road.toNodeId ?? road.to?.node_id ?? road.to?.nodeId ?? road.to?.id) === route.nodeIds[index + 1]
+          })
+          if (!validEdges || route.nodeIds.length !== route.edgeIds.length + 1) {
+            throw new Error('Route no longer matches connected road edges from the assigned unit to the incident')
+          }
+          if (type === 'impassable') {
+            if (!route.blockedEdgeId) return [type, null, null]
+          }
+          const positions = await loadPathGeometry(route)
+          if (!reachesMapMarker(positions[0], originLocation)
+            || !reachesMapMarker(positions.at(-1), incidentLocation)) {
+            throw new Error('The road route cannot reach the assigned unit or selected incident marker')
+          }
+          return [type, positions, null]
         } catch (geometryError) {
-          return [
-            type,
-            nodePositions,
-            `Street routing is unavailable (${geometryError.message || 'unknown error'}); displayed route lines connect graph nodes and are not street-by-street directions.`,
-          ]
+          return [type, null, geometryError.message || 'Road geometry could not be loaded']
         }
       }))
 
       if (cancelled) return
-      setRouteGeometries(Object.fromEntries(results.filter(([, positions]) => positions)))
-      setRouteGeometryError(results.find(([, , error]) => error)?.[2] || '')
+      const geometries = Object.fromEntries(results.filter(([, positions]) => positions))
+      if (geometries.recommended && geometries.passable
+        && geometries.recommended.length === geometries.passable.length
+        && geometries.recommended.every(([latitude, longitude], index) => (
+          Math.abs(latitude - geometries.passable[index][0]) < 1e-7
+          && Math.abs(longitude - geometries.passable[index][1]) < 1e-7
+        ))) {
+        delete geometries.passable
+      }
+      if (geometries.recommended && geometries.impassable) {
+        geometries.impassable = removeOverlappingRouteSegments(
+          geometries.impassable,
+          geometries.recommended,
+        )
+        if (!geometries.impassable.length) delete geometries.impassable
+      }
+      setRouteGeometries(geometries)
+      const routeError = results.find(([, , error]) => error)?.[2]
+      const hasRoute = Object.values(routeOptions).some(Boolean)
+      setRouteGeometryError(routeError || (!hasRoute
+        ? 'No routes available: the selected unit and incident have no connected path with valid road distance and passability data.'
+        : ''))
     }
 
     loadRouteGeometries()
     return () => { cancelled = true }
-  }, [nodes, routeOptions])
+  }, [routeRoads, routeOptions, incidentLocation, originLocation])
 
+  const hasSimulatedBlockedRoute = routeOptions.impassable?.edgeIds.some((edgeId) => (
+    routeRoads.find((road) => String(road.id) === String(edgeId))?.demoRouteFixture
+  ))
   const routeLabels = {
-    recommended: 'Recommended route',
-    passable: 'Passable route',
-    impassable: 'Blocked route (includes impassable road)',
+    recommended: `Recommended route · shortest passable (${routeOptions.recommended?.distanceKm?.toFixed(2) ?? '—'} km)`,
+    passable: `Passable · longer alternative (${routeOptions.passable?.distanceKm?.toFixed(2) ?? '—'} km)`,
+    impassable: hasSimulatedBlockedRoute
+      ? 'Simulated blocked route to the selected incident'
+      : `Blocked route via impassable road edge ${routeOptions.impassable?.blockedEdgeId ?? '—'}`,
   }
   const routeStyles = {
-    impassable: { color: '#c84d47', weight: 5, opacity: 0.95, dashArray: '8 7', lineCap: 'butt', lineJoin: 'round' },
-    passable: { color: '#2875a0', weight: 7, opacity: 0.95, lineCap: 'round', lineJoin: 'round' },
-    recommended: { color: '#db8b32', weight: 4, opacity: 1, lineCap: 'round', lineJoin: 'round' },
+    impassable: { color: '#c84d47', weight: 10, opacity: 1, dashArray: '8 7', lineCap: 'butt', lineJoin: 'round' },
+    passable: { color: '#2875a0', weight: 10, opacity: 0.92, lineCap: 'round', lineJoin: 'round' },
+    recommended: { color: recommendedRouteColor, weight: 6, opacity: 1, lineCap: 'round', lineJoin: 'round' },
   }
   const routeSegments = ['impassable', 'passable', 'recommended']
-    .filter((type) => routeOptions[type] && routeGeometries[type])
+    .filter((type) => routeOptions[type] && routeGeometries[type]?.length)
+  const unavailableRouteTypes = [
+    !routeOptions.passable && 'longer passable alternative',
+    !routeOptions.impassable && 'connected impassable route',
+  ].filter(Boolean)
+  const routeAvailabilityNote = routeOptions.recommended && unavailableRouteTypes.length
+    ? `Loaded road data has no ${unavailableRouteTypes.join(' or ')} for this unit and incident.`
+    : ''
+  const routePanes = {
+    impassable: 'blocked-route-pane',
+    passable: 'alternative-route-pane',
+    recommended: 'recommended-route-pane',
+  }
+  const routePaneOrder = [
+    ['impassable', 410],
+    ['passable', 420],
+    ['recommended', 430],
+  ]
+  const viewportPositions = useMemo(() => [
+    ...Object.entries(routeGeometries).flatMap(([type, geometry]) => (
+      type === 'impassable' ? geometry.flat() : geometry
+    )),
+    ...incidents.map((incident) => incident.location),
+    originUnit?.location,
+  ].filter((position) => (
+    Array.isArray(position) && position.length === 2 && position.every(Number.isFinite)
+  )), [routeGeometries, incidents, originUnit])
   return <>
     {routeGeometryError && <p className="map-route-error" role="status">{routeGeometryError}</p>}
+    {routeAvailabilityNote && <p className="map-route-note" role="status">{routeAvailabilityNote}</p>}
     <MapContainer center={mapCenter} zoom={13} scrollWheelZoom={false} zoomControl>
       <MapResizeHandler active={active} />
+      <MapViewport positions={viewportPositions} />
       <TileLayer attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
-      {routeSegments.map((type) => (
-        <Polyline key={`route-${type}`} positions={routeGeometries[type]} pathOptions={routeStyles[type]}>
-          <Popup>{routeLabels[type]}</Popup>
-        </Polyline>
+      {routePaneOrder.map(([type, zIndex]) => routeSegments.includes(type) && (
+        <Pane key={routePanes[type]} name={routePanes[type]} style={{ zIndex }}>
+          {(type === 'impassable' ? routeGeometries[type] : [routeGeometries[type]]).map((positions, index) => (
+            <Polyline key={`${type}-${index}`} positions={positions} pathOptions={routeStyles[type]}>
+              <Popup>{routeLabels[type]}</Popup>
+            </Polyline>
+          ))}
+        </Pane>
       ))}
-      {incidents.map((incident) => <CircleMarker key={incident.id} center={incident.location} radius={incident.priority === 'Critical' ? 9 : 7} pathOptions={{ color: '#fff', weight: 2, fillColor: incident.priority === 'Critical' ? '#d94e48' : '#e4a335', fillOpacity: 1 }}>
-        <Popup><strong>Incident {incident.id}</strong><br />{incident.priority} urgency<br />Road node {incident.locationNodeId ?? 'not set'}</Popup>
+      {incidents.map((incident) => <CircleMarker key={incident.id} center={incident.location} radius={incident.priority === 'Critical' ? 9 : 8} pathOptions={{ color: '#fff', weight: 2, fillColor: '#d94e48', fillOpacity: 1 }}>
+        <Tooltip permanent direction="right" offset={[8, 0]}>{incident.barangay}</Tooltip>
+        <Popup><strong>Incident {incident.id}</strong><br />{incident.barangay} · approximate barangay location<br />{incident.priority} urgency<br />Routing node {incident.locationNodeId ?? 'not set'}</Popup>
       </CircleMarker>)}
-      {originUnit?.location && <CircleMarker center={originUnit.location} radius={8} pathOptions={{ color: '#fff', weight: 2, fillColor: '#2875a0', fillOpacity: 1 }}>
+      {originUnit?.location && <CircleMarker center={originUnit.location} radius={12} pathOptions={{ color: '#fff', weight: 3, fillColor: '#1769aa', fillOpacity: 1 }}>
+        <Tooltip permanent direction="left" offset={[-8, 0]}>{originUnit.name} · assigned unit</Tooltip>
         <Popup><strong>{originUnit.name}</strong><br />Rescue unit · Point A</Popup>
       </CircleMarker>}
     </MapContainer>

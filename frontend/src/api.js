@@ -1,4 +1,8 @@
 import munkres from 'munkres-js'
+import { getDemoRouteFixtures } from './demoRouteFixtures'
+import { normalizeRoadGeometry } from './roadGeometry'
+import { findRoadPath } from './routeOptimization'
+import { demoBarangayLocations } from './data/barangays'
 
 const API_URL = '/api'
 const DEFAULT_USER_ID = Number(import.meta.env.VITE_USER_ID || 1)
@@ -6,25 +10,26 @@ const prioritiesForEvaluation = ['Critical', 'High', 'Medium', 'Low']
 const USE_DEMO_DATA = import.meta.env.VITE_DEMO_MODE !== 'false'
 const DEMO_STORAGE_KEY = 'flood-dispatch-demo-data'
 const INCIDENT_BARANGAY_KEY = 'flood-dispatch-incident-barangays'
+const INCIDENT_COORDINATE_KEY = 'flood-dispatch-incident-coordinates'
 const BARANGAY_COORDINATE_KEY = 'flood-dispatch-barangay-coordinates'
 let demoMode = false
 const roadGeometryCache = new Map()
 
 const createDemoData = () => ({
   nodes: [
-    { node_id: 1, node_type: 'Operations center', latitude: 14.852, longitude: 120.815 },
-    { node_id: 2, node_type: 'Road junction', latitude: 14.857, longitude: 120.821 },
-    { node_id: 3, node_type: 'Evacuation area', latitude: 14.846, longitude: 120.827 },
-    { node_id: 4, node_type: 'Road junction', latitude: 14.839747, longitude: 120.815885 },
-    { node_id: 5, node_type: 'Community center', latitude: 14.860767, longitude: 120.807717 },
-    { node_id: 6, node_type: 'Road junction', latitude: 14.851257, longitude: 120.818118 },
-    { node_id: 7, node_type: 'Road junction', latitude: 14.848848, longitude: 120.813924 },
+    { node_id: 1, node_type: 'Operations center', latitude: 14.841474, longitude: 120.812272 },
+    { node_id: 2, node_type: 'Road junction', latitude: 14.829974, longitude: 120.818234 },
+    { node_id: 3, node_type: 'Evacuation area', latitude: 14.857662, longitude: 120.814045 },
+    { node_id: 4, node_type: 'Road junction', latitude: 14.82364, longitude: 120.845272 },
+    { node_id: 5, node_type: 'Community center', latitude: 14.840909, longitude: 120.853198 },
+    { node_id: 6, node_type: 'Road junction', latitude: 14.85126, longitude: 120.835154 },
+    { node_id: 7, node_type: 'Road junction', latitude: 14.862076, longitude: 120.806557 },
   ],
   incidents: [
-    { incident_id: 1, reported_by: 1, location_node_id: 3, people_affected: 8, barangay: 'Pamarawan', urgency_level: 'High', status: 'Pending' },
-    { incident_id: 2, reported_by: 2, location_node_id: 4, people_affected: 6, barangay: 'Bangkal', urgency_level: 'Critical', status: 'Assigned' },
-    { incident_id: 3, reported_by: 1, location_node_id: 5, people_affected: 5, barangay: 'Tikay', urgency_level: 'Medium', status: 'Pending' },
-    { incident_id: 4, reported_by: 2, location_node_id: 2, people_affected: 2, barangay: 'Atlag', urgency_level: 'Low', status: 'Resolved' },
+    { incident_id: 1, reported_by: 1, location_node_id: 3, location_latitude: 14.857662, location_longitude: 120.814045, people_affected: 8, barangay: 'Guinhawa', urgency_level: 'High', status: 'Pending' },
+    { incident_id: 2, reported_by: 2, location_node_id: 4, location_latitude: 14.82364, location_longitude: 120.845272, people_affected: 6, barangay: 'Bangkal', urgency_level: 'Critical', status: 'Assigned' },
+    { incident_id: 3, reported_by: 1, location_node_id: 5, location_latitude: 14.840909, location_longitude: 120.853198, people_affected: 5, barangay: 'Tikay', urgency_level: 'Medium', status: 'Pending' },
+    { incident_id: 4, reported_by: 2, location_node_id: 2, location_latitude: 14.829974, location_longitude: 120.818234, people_affected: 2, barangay: 'Atlag', urgency_level: 'Low', status: 'Resolved' },
   ],
   units: [
     { unit_id: 1, name: 'Rescue Unit 1', type: 'Ambulance', current_node_id: 1, capacity: 10, status: 'Available' },
@@ -33,18 +38,18 @@ const createDemoData = () => ({
     { unit_id: 4, name: 'Rescue Unit 4', type: 'Rescue boat', current_node_id: 4, capacity: 12, status: 'Available' },
   ],
   edges: [
-    { edge_id: 1, from_node_id: 1, to_node_id: 2, is_passable: true },
-    { edge_id: 2, from_node_id: 2, to_node_id: 3, is_passable: true },
-    { edge_id: 3, from_node_id: 3, to_node_id: 4, is_passable: false },
-    { edge_id: 4, from_node_id: 2, to_node_id: 5, is_passable: true },
-    { edge_id: 5, from_node_id: 5, to_node_id: 4, is_passable: true },
-    { edge_id: 6, from_node_id: 5, to_node_id: 6, is_passable: true },
-    { edge_id: 7, from_node_id: 6, to_node_id: 4, is_passable: true },
-    { edge_id: 8, from_node_id: 5, to_node_id: 7, is_passable: true },
-    { edge_id: 9, from_node_id: 7, to_node_id: 4, is_passable: false },
+    { edge_id: 1, from_node_id: 1, to_node_id: 2, distance_km: 1.6731, is_passable: true },
+    { edge_id: 2, from_node_id: 2, to_node_id: 3, distance_km: 3.8961, is_passable: true },
+    { edge_id: 3, from_node_id: 3, to_node_id: 4, distance_km: 8.3789, is_passable: false },
+    { edge_id: 4, from_node_id: 2, to_node_id: 5, distance_km: 4.6077, is_passable: true },
+    { edge_id: 5, from_node_id: 5, to_node_id: 4, distance_km: 4.5206, is_passable: true },
+    { edge_id: 6, from_node_id: 5, to_node_id: 6, distance_km: 2.938, is_passable: true },
+    { edge_id: 7, from_node_id: 6, to_node_id: 4, distance_km: 6.286, is_passable: true },
+    { edge_id: 8, from_node_id: 5, to_node_id: 7, distance_km: 5.8187, is_passable: true },
+    { edge_id: 9, from_node_id: 7, to_node_id: 4, distance_km: 9.1667, is_passable: false },
   ],
   dispatches: [
-    { dispatch_id: 1, unit_id: 2, incident_id: 2, assigned_by: 2, status: 'Assigned', route: { total_distance: 1.8, node_ids: [5, 4], edge_ids: [5] } },
+    { dispatch_id: 1, unit_id: 2, incident_id: 2, assigned_by: 2, status: 'Assigned', route: { total_distance: 4.5206, node_ids: [5, 4], edge_ids: [5] } },
   ],
   logs: [
     { log_id: 3, user_id: 2, action_type: 'Assigned rescue unit to incident', time: '10:42 AM' },
@@ -54,7 +59,7 @@ const createDemoData = () => ({
   notifications: [
     { notification_id: 3, title: 'Critical incident assigned', message: 'Unit 2 is responding to Bangkal.', time: '10:42 AM', read: false },
     { notification_id: 2, title: 'Road marked impassable', message: 'Road edge 3 is closed to dispatch routes.', time: '10:18 AM', read: false },
-    { notification_id: 1, title: 'New incident reported', message: 'A High urgency incident was reported in Pamarawan.', time: '09:56 AM', read: true },
+    { notification_id: 1, title: 'New incident reported', message: 'A High urgency incident was reported in Guinhawa.', time: '09:56 AM', read: true },
   ],
 })
 
@@ -63,7 +68,15 @@ const readDemoData = () => {
     const saved = JSON.parse(window.localStorage.getItem(DEMO_STORAGE_KEY))
     if (saved && Array.isArray(saved.incidents) && Array.isArray(saved.units)) {
       const initial = createDemoData()
-      return {
+      const routeData = {
+        ...initial,
+        edges: initial.edges.map((edge) => ({
+          ...edge,
+          ...saved.edges?.find((savedEdge) => Number(savedEdge.edge_id) === Number(edge.edge_id)),
+          distance_km: edge.distance_km,
+        })),
+      }
+      const migratedData = {
         ...initial,
         ...saved,
         nodes: Array.isArray(saved.nodes)
@@ -77,27 +90,75 @@ const readDemoData = () => {
           : initial.nodes,
         edges: Array.isArray(saved.edges)
           ? [
-              ...saved.edges.filter((savedEdge) => ![6, 7, 8, 9].includes(Number(savedEdge.edge_id))),
+              ...saved.edges
+                .filter((savedEdge) => ![6, 7, 8, 9, 10, 11, 12, 13, 14].includes(Number(savedEdge.edge_id)))
+                .map((savedEdge) => {
+                  const seededEdge = initial.edges.find((edge) => Number(edge.edge_id) === Number(savedEdge.edge_id))
+                  return seededEdge
+                    ? { ...seededEdge, ...savedEdge, distance_km: seededEdge.distance_km }
+                    : savedEdge
+                }),
               ...initial.edges.filter((edge) => [6, 7, 8, 9].includes(Number(edge.edge_id))),
-              ...saved.edges.filter((savedEdge) => !initial.edges.some((edge) => Number(edge.edge_id) === Number(savedEdge.edge_id))),
+              ...saved.edges.filter((savedEdge) => (
+                !initial.edges.some((edge) => Number(edge.edge_id) === Number(savedEdge.edge_id))
+                && ![6, 7, 8, 9, 10, 11, 12, 13, 14].includes(Number(savedEdge.edge_id))
+              )),
             ]
           : initial.edges,
-        incidents: saved.incidents.map((incident) => ({
-          ...initial.incidents.find((item) => item.incident_id === Number(incident.incident_id)),
-          ...incident,
-          people_affected: incident.people_affected ?? 1,
-        })),
+        incidents: saved.incidents.map((incident) => {
+          const seededIncident = initial.incidents.find((item) => item.incident_id === Number(incident.incident_id))
+          return {
+            ...seededIncident,
+            ...incident,
+            ...(seededIncident ? {
+              location_node_id: seededIncident.location_node_id,
+              location_latitude: seededIncident.location_latitude,
+              location_longitude: seededIncident.location_longitude,
+              barangay: seededIncident.barangay,
+            } : {}),
+            people_affected: incident.people_affected ?? 1,
+          }
+        }),
         units: saved.units.map((unit) => ({
           ...initial.units.find((item) => item.unit_id === Number(unit.unit_id)),
           ...unit,
         })),
         dispatches: Array.isArray(saved.dispatches) ? saved.dispatches.map((dispatch) => {
           const initialDispatch = initial.dispatches.find((item) => item.dispatch_id === Number(dispatch.dispatch_id))
-          return { ...initialDispatch, ...dispatch, route: { ...initialDispatch?.route, ...dispatch.route } }
+          const unit = routeData.units.find((item) => Number(item.unit_id) === Number(dispatch.unit_id))
+          const incident = routeData.incidents.find((item) => Number(item.incident_id) === Number(dispatch.incident_id))
+          const route = dispatch.status !== 'Completed' && unit && incident
+            ? demoShortestPath(routeData, unit.current_node_id, incident.location_node_id)
+            : null
+          return {
+            ...initialDispatch,
+            ...dispatch,
+            route: {
+              ...initialDispatch?.route,
+              ...dispatch.route,
+              ...(dispatch.status !== 'Completed'
+                ? {
+                    total_distance: route?.distanceKm ?? 0,
+                    node_ids: route?.nodeIds || [],
+                    edge_ids: route?.edgeIds || [],
+                    status: route ? 'Active' : 'Unreachable',
+                  }
+                : {}),
+            },
+          }
         }) : initial.dispatches,
-        logs: Array.isArray(saved.logs) ? saved.logs : initial.logs,
-        notifications: Array.isArray(saved.notifications) ? saved.notifications : initial.notifications,
+        logs: Array.isArray(saved.logs)
+          ? saved.logs.map((log) => ({ ...log, action_type: String(log.action_type || '').replaceAll('Pamarawan', 'Guinhawa') }))
+          : initial.logs,
+        notifications: Array.isArray(saved.notifications)
+          ? saved.notifications.map((notification) => ({
+              ...notification,
+              message: String(notification.message || '').replaceAll('Pamarawan', 'Guinhawa'),
+            }))
+          : initial.notifications,
       }
+      writeDemoData(migratedData)
+      return migratedData
     }
   } catch {
     // Start with fresh sample records if browser storage is unavailable or invalid.
@@ -132,6 +193,33 @@ const saveIncidentBarangay = (incidentId, barangay) => {
   }
 }
 
+const readIncidentCoordinates = () => {
+  try {
+    return JSON.parse(window.localStorage.getItem(INCIDENT_COORDINATE_KEY) || '{}') || {}
+  } catch {
+    return {}
+  }
+}
+
+const readBarangayCoordinates = () => {
+  try {
+    return JSON.parse(window.localStorage.getItem(BARANGAY_COORDINATE_KEY) || '{}') || {}
+  } catch {
+    return {}
+  }
+}
+
+const saveIncidentCoordinates = (incidentId, coordinates) => {
+  if (!incidentId || !coordinates) return
+  const saved = readIncidentCoordinates()
+  saved[String(incidentId)] = coordinates
+  try {
+    window.localStorage.setItem(INCIDENT_COORDINATE_KEY, JSON.stringify(saved))
+  } catch {
+    // The returned incident remains usable if browser storage is unavailable.
+  }
+}
+
 const addDemoLog = (data, userId, action) => {
   const nextId = Math.max(0, ...data.logs.map((log) => Number(log.log_id) || 0)) + 1
   data.logs.unshift({ log_id: nextId, user_id: userId, action_type: action, time: 'Just now' })
@@ -149,7 +237,7 @@ const normalizeDemoData = (data) => {
   return {
     incidents,
     units,
-    roads: data.edges.map((item) => normalizeRoad(item, data.nodes)),
+    roads: data.edges.map((item) => normalizeRoad(item, data.nodes, { allowRouterGeometry: true })),
     logs: data.logs.map(normalizeLog),
     notifications: data.notifications || [],
     plans: data.dispatches.map((item) => normalizeDispatch(item, incidents, units)),
@@ -158,65 +246,23 @@ const normalizeDemoData = (data) => {
 }
 
 const demoShortestPath = (data, startId, endId) => {
-  const nodeById = new Map(data.nodes.map((node) => [Number(node.node_id), node]))
-  const start = Number(startId)
-  const end = Number(endId)
-  if (!nodeById.has(start) || !nodeById.has(end)) return null
-  if (start === end) return { distanceKm: 0, nodeIds: [start], edgeIds: [] }
+  const startNode = data.nodes.find((node) => String(node.node_id) === String(startId))
+  const endNode = data.nodes.find((node) => String(node.node_id) === String(endId))
+  const routeFixtures = getDemoRouteFixtures(
+    startId,
+    endId,
+    startNode ? [Number(startNode.latitude), Number(startNode.longitude)] : null,
+    endNode ? [Number(endNode.latitude), Number(endNode.longitude)] : null,
+  )
+  if (routeFixtures.length) return findRoadPath(routeFixtures, startId, endId)
 
-  const adjacency = new Map(data.nodes.map((node) => [Number(node.node_id), []]))
-  for (const edge of data.edges.filter((item) => item.is_passable)) {
-    const fromId = Number(edge.from_node_id)
-    const toId = Number(edge.to_node_id)
-    const from = nodeById.get(fromId)
-    const to = nodeById.get(toId)
-    if (!from || !to) continue
-    const radians = (degrees) => degrees * Math.PI / 180
-    const latitudeDelta = radians(Number(to.latitude) - Number(from.latitude))
-    const longitudeDelta = radians(Number(to.longitude) - Number(from.longitude))
-    const latitude1 = radians(Number(from.latitude))
-    const latitude2 = radians(Number(to.latitude))
-    const haversine = Math.sin(latitudeDelta / 2) ** 2
-      + Math.cos(latitude1) * Math.cos(latitude2) * Math.sin(longitudeDelta / 2) ** 2
-    const weight = 6371 * 2 * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine))
-    adjacency.get(fromId).push({ nodeId: toId, edgeId: Number(edge.edge_id), weight })
-  }
-
-  const distances = new Map([[start, 0]])
-  const previous = new Map()
-  const visited = new Set()
-  while (true) {
-    let current = null
-    let best = Infinity
-    for (const [nodeId, distance] of distances) {
-      if (!visited.has(nodeId) && distance < best) {
-        current = nodeId
-        best = distance
-      }
-    }
-    if (current === null) return null
-    if (current === end) break
-    visited.add(current)
-    for (const edge of adjacency.get(current) || []) {
-      const candidate = best + edge.weight
-      if (candidate < (distances.get(edge.nodeId) ?? Infinity)) {
-        distances.set(edge.nodeId, candidate)
-        previous.set(edge.nodeId, { nodeId: current, edgeId: edge.edgeId })
-      }
-    }
-  }
-
-  const nodeIds = [end]
-  const edgeIds = []
-  let current = end
-  while (current !== start) {
-    const step = previous.get(current)
-    if (!step) return null
-    nodeIds.unshift(step.nodeId)
-    edgeIds.unshift(step.edgeId)
-    current = step.nodeId
-  }
-  return { distanceKm: distances.get(end), nodeIds, edgeIds }
+  const roads = data.edges.map((edge) => ({
+    ...edge,
+    id: String(edge.edge_id),
+    distanceKm: edge.distance_km,
+    condition: edge.is_passable === true ? 'Passable' : edge.is_passable === false ? 'Impassable' : 'Unknown',
+  }))
+  return findRoadPath(roads, startId, endId)
 }
 
 const demoDispatchRecommendations = () => {
@@ -276,7 +322,7 @@ const listFrom = (body, ...keys) => {
 
 const value = (record, ...keys) => keys.map((key) => record?.[key]).find((item) => item !== undefined && item !== null)
 const getId = (record) => value(record, 'id', 'incident_id', 'unit_id', 'node_id', 'edge_id', 'dispatch_id', 'route_id', 'log_id')
-const distanceBetweenNodesKm = (first, second) => {
+const distanceBetweenNodeCoordinates = (first, second) => {
   const radians = (degrees) => degrees * Math.PI / 180
   const latitude1 = radians(Number(first.latitude))
   const latitude2 = radians(Number(second.latitude))
@@ -286,22 +332,29 @@ const distanceBetweenNodesKm = (first, second) => {
     + Math.cos(latitude1) * Math.cos(latitude2) * Math.sin(longitudeDelta / 2) ** 2
   return 6371 * 2 * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine))
 }
-
 const normalizeIncident = (incident, nodes, barangayLabels = {}) => {
   const nodeId = value(incident, 'location_node_id', 'locationNodeId')
   const node = nodes.find((item) => String(getId(item)) === String(nodeId))
+  const id = getId(incident)
+  const barangay = value(incident, 'barangay', 'location_name') || barangayLabels[String(id)] || (nodeId ? `Node ${nodeId}` : 'Location not set')
+  const storedCoordinates = readIncidentCoordinates()[String(id)]
+  const barangayCoordinates = readBarangayCoordinates()[barangay]
+  const latitude = Number(value(incident, 'location_latitude', 'locationLatitude') ?? storedCoordinates?.latitude ?? barangayCoordinates?.latitude)
+  const longitude = Number(value(incident, 'location_longitude', 'locationLongitude') ?? storedCoordinates?.longitude ?? barangayCoordinates?.longitude)
   const urgency = value(incident, 'urgency_level', 'urgencyLevel', 'priority') || 'Medium'
 
   return {
     ...incident,
-    id: String(getId(incident) ?? ''),
-    barangay: value(incident, 'barangay', 'location_name') || barangayLabels[String(getId(incident))] || (nodeId ? `Node ${nodeId}` : 'Location not set'),
+    id: String(id ?? ''),
+    barangay,
     type: value(incident, 'type', 'incident_type') || 'Assistance request',
     priority: String(urgency).charAt(0).toUpperCase() + String(urgency).slice(1).toLowerCase(),
     people: value(incident, 'people', 'people_affected') ?? '—',
     status: value(incident, 'status') || 'Pending',
     reported: value(incident, 'reported', 'created_at', 'reported_at') || '—',
-    location: node ? [Number(value(node, 'latitude')), Number(value(node, 'longitude'))] : [14.852, 120.815],
+    location: Number.isFinite(latitude) && Number.isFinite(longitude)
+      ? [latitude, longitude]
+      : node ? [Number(value(node, 'latitude')), Number(value(node, 'longitude'))] : [14.852, 120.815],
     locationNodeId: nodeId,
   }
 }
@@ -327,14 +380,18 @@ const normalizeUnit = (unit, nodes) => {
   }
 }
 
-const normalizeRoad = (edge, nodes) => {
+const normalizeRoad = (edge, nodes, { allowRouterGeometry = false } = {}) => {
   const fromId = value(edge, 'from_node_id', 'fromNodeId')
   const toId = value(edge, 'to_node_id', 'toNodeId')
   const from = nodes.find((item) => String(getId(item)) === String(fromId))
   const to = nodes.find((item) => String(getId(item)) === String(toId))
   const passable = value(edge, 'is_passable', 'isPassable')
   const storedDistance = value(edge, 'distance_km', 'distanceKm', 'distance')
-  const hasCoordinates = [from?.latitude, from?.longitude, to?.latitude, to?.longitude].every((coordinate) => Number.isFinite(Number(coordinate)))
+  const { positions: geometryPositions, error: geometryError } = normalizeRoadGeometry(
+    value(edge, 'geometry_geojson', 'geometryGeoJSON'),
+    from,
+    to,
+  )
 
   return {
     ...edge,
@@ -342,8 +399,10 @@ const normalizeRoad = (edge, nodes) => {
     name: value(edge, 'name', 'road_name') || `Road edge ${getId(edge)}`,
     segment: `${fromId ?? '?'} → ${toId ?? '?'}`,
     condition: passable === false ? 'Impassable' : passable === true ? 'Passable' : 'Unknown',
-    distanceKm: storedDistance ?? (hasCoordinates ? distanceBetweenNodesKm(from, to) : null),
-    distanceEstimated: storedDistance == null && hasCoordinates,
+    distanceKm: storedDistance ?? null,
+    allowRouterGeometry,
+    geometryPositions,
+    geometryError,
     depth: 'Not recorded',
     updated: value(edge, 'updated', 'updated_at') || '—',
     from,
@@ -392,7 +451,7 @@ const normalizeLog = (log) => ({
   userId: value(log, 'user_id', 'userId'),
 })
 
-export const resolveBarangayNodeId = async (barangay, nodes) => {
+export const resolveBarangayLocation = async (barangay, nodes) => {
   const nodeCoordinates = nodes.map((node) => ({
     id: value(node, 'node_id', 'nodeId', 'id'),
     latitude: Number(value(node, 'latitude')),
@@ -400,28 +459,58 @@ export const resolveBarangayNodeId = async (barangay, nodes) => {
   })).filter((node) => node.id != null && Number.isFinite(node.latitude) && Number.isFinite(node.longitude))
   if (!nodeCoordinates.length) throw new Error('No road-network nodes are available for location matching')
 
-  let coordinates = null
-  try {
-    const saved = JSON.parse(window.localStorage.getItem(BARANGAY_COORDINATE_KEY) || '{}')
-    coordinates = saved[barangay] || null
-  } catch {
-    coordinates = null
-  }
+  let coordinates = (demoMode ? demoBarangayLocations[barangay] : null)
+    || readBarangayCoordinates()[barangay]
+    || null
 
   if (!coordinates) {
     const query = encodeURIComponent(`${barangay}, Malolos, Bulacan, Philippines`)
-    const response = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=ph&q=${query}`, {
-      headers: { Accept: 'application/json' },
-    })
-    if (!response.ok) throw new Error('Could not locate the selected barangay. Try again when the map service is available.')
-    const results = await response.json()
-    if (!results[0]) throw new Error('Could not locate the selected barangay. Check the selected barangay and try again.')
-    coordinates = { latitude: Number(results[0].lat), longitude: Number(results[0].lon) }
+    let nominatimError = ''
+    try {
+      const response = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=ph&q=${query}`, {
+        headers: { Accept: 'application/json' },
+      })
+      if (!response.ok) throw new Error(`OpenStreetMap geocoder returned ${response.status}`)
+      const results = await response.json()
+      const result = results.find((candidate) => (
+        candidate.display_name?.includes('Malolos') && candidate.display_name?.includes('Bulacan')
+      ))
+      if (!result) throw new Error('OpenStreetMap did not return a Malolos, Bulacan location')
+      const candidateCoordinates = { latitude: Number(result.lat), longitude: Number(result.lon) }
+      if (!Number.isFinite(candidateCoordinates.latitude) || !Number.isFinite(candidateCoordinates.longitude)) {
+        throw new Error('OpenStreetMap returned invalid coordinates')
+      }
+      coordinates = candidateCoordinates
+    } catch (error) {
+      nominatimError = error.message || 'OpenStreetMap geocoder failed'
+    }
+
+    if (!coordinates) {
+      try {
+        const response = await fetch(`https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?SingleLine=${query}&f=json&maxLocations=5`, {
+          headers: { Accept: 'application/json' },
+        })
+        if (!response.ok) throw new Error(`Alternative geocoder returned ${response.status}`)
+        const body = await response.json()
+        const candidate = body.candidates?.find((item) => (
+          item.address?.includes('Malolos') && item.address?.includes('Bulacan')
+        ))
+        if (!candidate) throw new Error('Alternative geocoder did not return a Malolos, Bulacan location')
+        const candidateCoordinates = { latitude: Number(candidate.location.y), longitude: Number(candidate.location.x) }
+        if (!Number.isFinite(candidateCoordinates.latitude) || !Number.isFinite(candidateCoordinates.longitude)) {
+          throw new Error('Alternative geocoder returned invalid coordinates')
+        }
+        coordinates = candidateCoordinates
+      } catch (error) {
+        throw new Error(`Could not locate ${barangay} in Malolos. OpenStreetMap: ${nominatimError}. Alternative geocoder: ${error.message || 'request failed'}.`, { cause: error })
+      }
+    }
+
     if (!Number.isFinite(coordinates.latitude) || !Number.isFinite(coordinates.longitude)) {
-      throw new Error('The map service returned an invalid location for this barangay. Try again.')
+      throw new Error('The map service returned invalid coordinates for this barangay.')
     }
     try {
-      const saved = JSON.parse(window.localStorage.getItem(BARANGAY_COORDINATE_KEY) || '{}')
+      const saved = readBarangayCoordinates()
       window.localStorage.setItem(BARANGAY_COORDINATE_KEY, JSON.stringify({ ...saved, [barangay]: coordinates }))
     } catch {
       // Geocoding can still be used for this request without browser storage.
@@ -435,8 +524,15 @@ export const resolveBarangayNodeId = async (barangay, nodes) => {
     const latitude = radians(coordinates.latitude)
     return latitudeDelta ** 2 + Math.cos(latitude) ** 2 * longitudeDelta ** 2
   }
-  return String(nodeCoordinates.reduce((nearest, node) => distanceSquared(node) < distanceSquared(nearest) ? node : nearest).id)
+  return {
+    locationNodeId: String(nodeCoordinates.reduce((nearest, node) => distanceSquared(node) < distanceSquared(nearest) ? node : nearest).id),
+    location: [coordinates.latitude, coordinates.longitude],
+  }
 }
+
+export const resolveBarangayNodeId = async (barangay, nodes) => (
+  (await resolveBarangayLocation(barangay, nodes)).locationNodeId
+)
 
 export const loadDashboard = async () => {
   if (USE_DEMO_DATA) {
@@ -492,11 +588,11 @@ export const loadDashboard = async () => {
   }
 }
 
-export const createIncident = async ({ urgency_level, location_node_id, people_affected, barangay, reported_by = DEFAULT_USER_ID }) => {
+export const createIncident = async ({ urgency_level, location_node_id, location_latitude, location_longitude, people_affected, barangay, reported_by = DEFAULT_USER_ID }) => {
   if (demoMode) {
     const data = readDemoData()
     const incident_id = Math.max(0, ...data.incidents.map((item) => Number(item.incident_id) || 0)) + 1
-    const incident = { incident_id, reported_by, location_node_id: Number(location_node_id), people_affected: Number(people_affected), barangay, urgency_level, status: 'Pending' }
+    const incident = { incident_id, reported_by, location_node_id: Number(location_node_id), location_latitude, location_longitude, people_affected: Number(people_affected), barangay, urgency_level, status: 'Pending' }
     data.incidents.unshift(incident)
     addDemoLog(data, reported_by, `Created incident ${incident_id}`)
     addDemoNotification(data, `New ${urgency_level} incident`, `${barangay} needs ${people_affected} residents assisted.`)
@@ -506,10 +602,20 @@ export const createIncident = async ({ urgency_level, location_node_id, people_a
   const body = await request('/incidents', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ urgency_level, location_node_id: Number(location_node_id), people_affected: Number(people_affected), reported_by: Number(reported_by), barangay, status: 'Pending' }),
+    body: JSON.stringify({
+      urgency_level,
+      location_node_id: Number(location_node_id),
+      location_latitude: Number(location_latitude),
+      location_longitude: Number(location_longitude),
+      people_affected: Number(people_affected),
+      reported_by: Number(reported_by),
+      barangay,
+      status: 'Pending',
+    }),
   })
   const incident = body.incident || body
   saveIncidentBarangay(getId(incident), barangay)
+  saveIncidentCoordinates(getId(incident), { latitude: Number(location_latitude), longitude: Number(location_longitude) })
   return incident
 }
 
@@ -616,51 +722,59 @@ export const createDispatch = async ({ unit_id, incident_id, assigned_by, distan
 export const checkHealth = () => request('/health')
 
 export const getRoadGeometry = async (road) => {
-  if (!road.from || !road.to) return null
+  if (road.geometryPositions?.length) return road.geometryPositions
+  if (!road.allowRouterGeometry) {
+    throw new Error(`Road edge ${road.id}: verified geometry is not recorded`)
+  }
+  if (!road.from || !road.to) {
+    throw new Error(`Road edge ${road.id}: endpoint nodes are unavailable`)
+  }
+
   const start = [Number(road.from.longitude), Number(road.from.latitude)]
   const end = [Number(road.to.longitude), Number(road.to.latitude)]
-  if (![...start, ...end].every(Number.isFinite)) return null
-
-  const key = [...start, ...end].join(',')
+  const viaCoordinates = Array.isArray(road.viaCoordinates) ? road.viaCoordinates : []
+  const routeCoordinates = [start, ...viaCoordinates, end]
+  if (![...start, ...end].every(Number.isFinite)) {
+    throw new Error(`Road edge ${road.id}: endpoint coordinates are invalid`)
+  }
+  if (viaCoordinates.some((coordinate) => !Array.isArray(coordinate)
+    || coordinate.length !== 2
+    || !coordinate.every(Number.isFinite))) {
+    throw new Error(`Road edge ${road.id}: via coordinates are invalid`)
+  }
+  const key = `demo-edge:${road.id}:${routeCoordinates.flat().join(',')}`
   if (roadGeometryCache.has(key)) return roadGeometryCache.get(key)
 
-  const coordinates = `${start.join(',')};${end.join(',')}`
-  const response = await fetch(`https://router.project-osrm.org/route/v1/driving/${coordinates}?overview=full&geometries=geojson&steps=false`)
-  if (!response.ok) throw new Error(`Road routing request failed: ${response.status}`)
-  const body = await response.json()
-  const geometry = body.code === 'Ok' ? body.routes?.[0]?.geometry?.coordinates : null
-  const positions = Array.isArray(geometry) ? geometry.map(([longitude, latitude]) => [latitude, longitude]) : null
-  if (!positions?.length) throw new Error('No road geometry returned')
-
-  roadGeometryCache.set(key, positions)
-  return positions
-}
-
-export const getRouteGeometry = async (nodeIds, nodes) => {
-  if (nodeIds.length < 2) return null
-  const nodeById = new Map(nodes.map((node) => [String(value(node, 'node_id', 'nodeId', 'id')), node]))
-  const coordinates = nodeIds.map((nodeId) => {
-    const node = nodeById.get(String(nodeId))
-    if (!node) throw new Error(`Road node ${nodeId} is not available for route mapping`)
-    const longitude = Number(value(node, 'longitude'))
-    const latitude = Number(value(node, 'latitude'))
-    if (!Number.isFinite(longitude) || !Number.isFinite(latitude)) {
-      throw new Error(`Road node ${nodeId} has invalid coordinates`)
+  const coordinates = routeCoordinates.map((coordinate) => coordinate.join(',')).join(';')
+  const geometryRequest = (async () => {
+    const response = await fetch(`https://router.project-osrm.org/route/v1/driving/${coordinates}?overview=full&geometries=geojson&steps=false`)
+    if (!response.ok) throw new Error(`Road edge ${road.id} geometry request failed: ${response.status}`)
+    const body = await response.json()
+    const geometry = body.code === 'Ok' ? body.routes?.[0]?.geometry?.coordinates : null
+    if (!Array.isArray(geometry) || geometry.length < 2) {
+      throw new Error(`No road-following geometry returned for road edge ${road.id}`)
     }
-    return `${longitude},${latitude}`
-  })
-  const key = `route:${coordinates.join(';')}`
-  if (roadGeometryCache.has(key)) return roadGeometryCache.get(key)
 
-  const response = await fetch(`https://router.project-osrm.org/route/v1/driving/${coordinates.join(';')}?overview=full&geometries=geojson&steps=false`)
-  if (!response.ok) throw new Error(`Route geometry request failed: ${response.status}`)
-  const body = await response.json()
-  const geometry = body.code === 'Ok' ? body.routes?.[0]?.geometry?.coordinates : null
-  const positions = Array.isArray(geometry) ? geometry.map(([longitude, latitude]) => [latitude, longitude]) : null
-  if (!positions?.length) throw new Error('No road-following geometry returned for route')
-
-  roadGeometryCache.set(key, positions)
-  return positions
+    const positions = geometry.map(([longitude, latitude]) => [Number(latitude), Number(longitude)])
+    if (positions.some(([latitude, longitude]) => !Number.isFinite(latitude) || !Number.isFinite(longitude))) {
+      throw new Error(`Road edge ${road.id} geometry contains invalid coordinates`)
+    }
+    const endpointDistance = (position, endpoint) => distanceBetweenNodeCoordinates(
+      { latitude: position[0], longitude: position[1] },
+      { latitude: endpoint[1], longitude: endpoint[0] },
+    )
+    if (endpointDistance(positions[0], start) > 0.1 || endpointDistance(positions.at(-1), end) > 0.1) {
+      throw new Error(`Road edge ${road.id} does not reach its graph node on the drivable network`)
+    }
+    return positions
+  })()
+  roadGeometryCache.set(key, geometryRequest)
+  try {
+    return await geometryRequest
+  } catch (error) {
+    roadGeometryCache.delete(key)
+    throw error
+  }
 }
 
 export const updateDispatchStatus = async (dispatchId, status) => {

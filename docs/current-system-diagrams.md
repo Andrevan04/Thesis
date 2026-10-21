@@ -15,7 +15,7 @@ flowchart LR
     Optimizer[Dijkstra route engine\nHungarian assignment engine]
     DB[(PostgreSQL\nIncidents, units, roads, dispatches, routes, logs)]
     OSMnx[OSMnx road-network import\nprovides road_edge.distance_km]
-    MapServices[OpenStreetMap tiles / OSRM geometry]
+    MapServices[OpenStreetMap tiles / stored road-edge geometry]
     DemoStore[(Browser localStorage\nDemo users, notifications, sample data)]
 
     Coordinator --> UI
@@ -77,6 +77,7 @@ erDiagram
         int from_node_id FK
         int to_node_id FK
         double distance_km
+        GeoJSON geometry_geojson
         boolean is_passable
     }
     DISPATCH {
@@ -100,8 +101,10 @@ erDiagram
     }
 ```
 
-`unit_type`, `distance_km`, route path arrays, and route status are added by `backend/migrations/002_weighted_edges_and_route_paths.sql`; `people_affected` is added by migration 001. The OSMnx import must populate `road_edge.distance_km` before database-backed optimization is enabled. The original thesis ERD should show these fields. The `USER` entity shown here still reflects the limited database contract; full name, email, password hash, and active-account management need a separate production authentication/account schema and API.
+`unit_type`, `distance_km`, route path arrays, and route status are added by `backend/migrations/002_weighted_edges_and_route_paths.sql`; `people_affected` is added by migration 001; `barangay`, `location_latitude`, and `location_longitude` are added by migration 003; and `geometry_geojson` is added by migration 004. Incident coordinates identify the approximate barangay point, while `location_node_id` remains the road-network endpoint used by route calculations. The road-data import must populate positive `road_edge.distance_km` values and directed GeoJSON LineStrings that match each edge's endpoint nodes. The original thesis ERD should show these fields. The `USER` entity shown here still reflects the limited database contract; full name, email, password hash, and active-account management need a separate production authentication/account schema and API.
 
 ## Map route semantics
 
-Road passability describes an individual edge, while assigned-route maps compare Point A-to-Point B route options for the selected active assignment. The orange recommended route is the shortest passable path; the blue passable route is a longer alternative; and a red dashed blocked route connects Point A to Point B through an impassable edge to show the route that cannot be taken. The blocked route is computed as a passable approach, exactly one closed edge, and a passable continuation to the incident; repeated nodes and dead-end branches are excluded. Each complete route is rendered as one road-following geometry through its ordered network-node waypoints, avoiding gaps and misleading dead-end branches from independently snapped per-edge geometry. Demo route waypoint coordinates are aligned with their snapped road positions so route geometry joins at the network nodes and endpoints. The red dashed route is explanatory only and is never treated as traversable. All available route types are displayed together, with the recommended route layered above passable alternatives and blocked routes. Overview and dispatch maps select from active assignments; pending and resolved incidents are excluded. Dispatch recommendations continue to use passable edges only.
+In database mode, assigned-route maps compute a shortest passable graph path for the orange recommended route, a distinct strictly longer passable graph path for blue, and a connected path containing a marked impassable edge for red dashed. Red geometry is split around portions that overlap the orange route so the two classifications are not drawn on top of each other; orange remains rendered above blue and red. Routes use positive imported `distance_km` values and per-edge `geometry_geojson` LineStrings validated against directed road nodes; missing or invalid values are not replaced with guessed paths.
+
+In demo mode, the three seeded assignments use explicit route fixtures so each presentation map has a shortest passable route, a longer passable alternative, and a simulated blocked route to the same incident. The shortest fixture is also used for dispatch distance calculations. Route distances and via points are based on OSRM road routes; passability and blocked status are simulated presentation data, not verified conditions. The browser fetches street-following geometry and only draws routes that reach both unit and incident markers; it does not add straight connectors. Overlapping red geometry is hidden only where it follows the orange route. Other assignments continue to use the sample graph and omit unavailable alternatives. The demo intake is restricted to 10 nearby barangays: Guinhawa, Catmon, Bulihan, Mojon, San Vicente (Poblacion), Tikay, Dakila, Atlag, Bangkal, and Santo Rosario (Poblacion); other barangays are disabled. Overview and dispatch maps compute routes for the selected active assignment, and dispatch recommendations use passable paths only.
