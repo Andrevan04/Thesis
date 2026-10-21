@@ -339,23 +339,38 @@ function App() {
   const recommendDispatches = async (navigateToDispatches = true) => {
     try {
       const result = await api.getDispatchRecommendations()
+      if (!Array.isArray(result.assignments)) {
+        throw new Error('The recommendation service returned an invalid assignment list')
+      }
       const assignments = result.assignments.map((assignment) => {
-        const incident = incidents.find((item) => item.id === String(assignment.incidentId))
-        const unit = units.find((item) => item.id === String(assignment.unitId))
+        const incidentId = String(assignment.incidentId ?? assignment.incident_id ?? '')
+        const unitId = String(assignment.unitId ?? assignment.unit_id ?? '')
+        const incident = incidents.find((item) => item.id === incidentId)
+        const unit = units.find((item) => item.id === unitId)
+        const nodeIds = assignment.nodeIds ?? assignment.node_ids ?? assignment.path ?? []
+        const edgeIds = assignment.edgeIds ?? assignment.edge_ids ?? nodeIds.slice(1).map((nodeId, index) => (
+          roads.find((road) => String(road.from_node_id ?? road.fromNodeId) === String(nodeIds[index])
+            && String(road.to_node_id ?? road.toNodeId) === String(nodeId)
+            && road.condition === 'Passable')?.id
+        )).filter((edgeId) => edgeId != null)
         const priority = assignment.priority || incident?.priority || 'Medium'
         return {
           ...assignment,
-          incidentId: String(assignment.incidentId),
-          incidentLabel: assignment.incidentLabel || incident?.barangay || `Incident ${assignment.incidentId}`,
-          unitId: String(assignment.unitId),
-          unitName: assignment.unitName || unit?.name || `Rescue Unit ${assignment.unitId}`,
+          incidentId,
+          incidentLabel: assignment.incidentLabel || incident?.barangay || `Incident ${incidentId}`,
+          unitId,
+          unitName: assignment.unitName || unit?.name || `Rescue Unit ${unitId}`,
+          distanceKm: assignment.distanceKm ?? assignment.distance_km ?? null,
+          nodeIds,
+          edgeIds,
           priority,
         }
       })
 
       if (!assignments.length) {
         setRecommendations([])
-        if (navigateToDispatches) setNotice(incidents.some((incident) => incident.status.toLowerCase() === 'pending')
+        const unassignedIncidentIds = result.unassignedIncidentIds ?? result.unassigned_incident_ids ?? []
+        if (navigateToDispatches) setNotice(unassignedIncidentIds.length || incidents.some((incident) => incident.status.toLowerCase() === 'pending')
           ? 'No feasible assignments: check available units, capacity, and passable roads'
           : 'No pending incidents')
         return
@@ -364,7 +379,7 @@ function App() {
       setRecommendations([{
         id: 'draft-plan',
         assignments,
-        unassignedIncidentIds: result.unassignedIncidentIds || [],
+        unassignedIncidentIds: result.unassignedIncidentIds ?? result.unassigned_incident_ids ?? [],
       }])
       if (navigateToDispatches) setActivePage('dispatches')
     } catch (requestError) {
@@ -638,7 +653,7 @@ function App() {
       <PageHeading title={activeRole === 'Coordinator' ? 'Generate plan' : 'Dispatch plan'} subtitle={activeRole === 'Coordinator' ? `Re-optimize pending assignments to minimize total route distance using ${assignmentAlgorithmLabel.toLowerCase()}; route lengths use ${routeAlgorithmLabel.toLowerCase()}.` : 'Track route progress and confirmed dispatches for the assigned responder.'} action={activeRole === 'Coordinator' ? <button className="button-primary" onClick={recommendDispatches}><RefreshCw size={15} /> Re-optimize plan</button> : null} />
       {recommendations.map((recommendation) => <article className="plan-card" key={recommendation.id}>
         <div className="plan-heading"><div><p className="eyebrow">Review before confirming dispatch</p><h3>Distance-minimized assignments</h3></div><span className="muted">{recommendation.unassignedIncidentIds.length} unassigned</span></div>
-        <div className="table-scroll"><table className="data-table"><thead><tr><th>Incident</th><th>Unit</th><th>Urgency</th><th>Route distance</th><th>Route path</th></tr></thead><tbody>{recommendation.assignments.map((assignment) => <tr key={assignment.incidentId}><td>{assignment.incidentLabel} · {assignment.incidentId}</td><td>{assignment.unitName} · {assignment.unitId}</td><td>{assignment.priority}</td><td>{Number(assignment.distanceKm).toFixed(2)} km</td><td>{assignment.nodeIds?.join(' → ') || '—'}</td></tr>)}</tbody></table></div>
+        <div className="table-scroll"><table className="data-table"><thead><tr><th>Incident</th><th>Unit</th><th>Urgency</th><th>Route distance</th><th>Route path</th></tr></thead><tbody>{recommendation.assignments.map((assignment) => <tr key={assignment.incidentId}><td>{assignment.incidentLabel} · {assignment.incidentId}</td><td>{assignment.unitName} · {assignment.unitId}</td><td>{assignment.priority}</td><td>{assignment.distanceKm != null && Number.isFinite(Number(assignment.distanceKm)) ? `${Number(assignment.distanceKm).toFixed(2)} km` : 'Unavailable'}</td><td>{assignment.nodeIds?.join(' → ') || '—'}</td></tr>)}</tbody></table></div>
         {recommendation.unassignedIncidentIds.length > 0 && <p className="unassigned-notice"><strong>Manual follow-up needed:</strong> {recommendation.unassignedIncidentIds.map((incidentId) => {
           const incident = incidents.find((item) => item.id === String(incidentId))
           return `${incident?.barangay || 'Incident'} · ${incidentId}`
@@ -794,10 +809,23 @@ function NetworkMap({ roads, nodes, incidents, routeEdgeIds = [], routeNodeIds =
     const loadRouteGeometries = async () => {
       const results = await Promise.all(Object.entries(routeOptions).map(async ([type, route]) => {
         if (!route?.nodeIds?.length) return [type, null, null]
+        const nodePositions = route.nodeIds.map((nodeId) => {
+          const node = nodes.find((item) => String(item.node_id ?? item.nodeId ?? item.id) === String(nodeId))
+          const latitude = Number(node?.latitude)
+          const longitude = Number(node?.longitude)
+          return Number.isFinite(latitude) && Number.isFinite(longitude) ? [latitude, longitude] : null
+        })
+        if (nodePositions.length !== route.nodeIds.length || nodePositions.some((position) => !position)) {
+          return [type, null, 'Route geometry is unavailable because a road node has invalid coordinates']
+        }
         try {
           return [type, await api.getRouteGeometry(route.nodeIds, nodes), null]
         } catch (geometryError) {
-          return [type, null, geometryError.message || 'Could not load road-following route geometry']
+          return [
+            type,
+            nodePositions,
+            `Street routing is unavailable (${geometryError.message || 'unknown error'}); displayed route lines connect graph nodes and are not street-by-street directions.`,
+          ]
         }
       }))
 
